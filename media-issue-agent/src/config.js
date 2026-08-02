@@ -28,6 +28,20 @@ export function migrateRetiredCodexSettings(settings) {
   };
 }
 
+export const CODEX_SETTING_DEFAULTS = Object.freeze({
+  model: DEFAULT_CODEX_MODEL,
+  reasoningEffort: DEFAULT_CODEX_REASONING_EFFORT,
+  fastMode: true,
+  serviceTier: "fast",
+  repairContext: ""
+});
+
+export const OPERATIONS_SETTING_DEFAULTS = Object.freeze({
+  pollIntervalSeconds: 300,
+  snapshotRetention: 200,
+  serverOwnerReporterUsername: ""
+});
+
 function truthy(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -48,6 +62,13 @@ function list(value) {
     .split(",")
     .map(entry => entry.trim())
     .filter(Boolean);
+}
+
+function hasEnvValue(env, key) {
+  return Object.prototype.hasOwnProperty.call(env, key)
+    && env[key] !== undefined
+    && env[key] !== null
+    && String(env[key]) !== "";
 }
 
 function containsApiKey(value) {
@@ -169,10 +190,10 @@ export async function loadConfig(env = process.env, options = {}) {
     dbPath: env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite",
     logPath: env.ISSUE_AGENT_LOG_PATH || defaultDiagnosticLogPath(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"),
     repairWorkspaceRoot: env.ISSUE_AGENT_REPAIR_WORKSPACE_ROOT || path.join(path.dirname(env.ISSUE_AGENT_DB_PATH || "/state/media-issue-agent.sqlite"), "repair-workspaces"),
-    repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || "",
-    serverOwnerReporterUsername: String(env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || "").trim(),
-    pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, 300, 30),
-    issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, 200, 1),
+    repairContext: env.ISSUE_AGENT_REPAIR_CONTEXT || CODEX_SETTING_DEFAULTS.repairContext,
+    serverOwnerReporterUsername: String(env.ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME || OPERATIONS_SETTING_DEFAULTS.serverOwnerReporterUsername).trim(),
+    pollIntervalSeconds: integer(env.ISSUE_AGENT_POLL_INTERVAL_SECONDS, OPERATIONS_SETTING_DEFAULTS.pollIntervalSeconds, 30),
+    issueSnapshotRetention: integer(env.ISSUE_AGENT_SNAPSHOT_RETENTION, OPERATIONS_SETTING_DEFAULTS.snapshotRetention, 1),
     pushoverAppToken: env.ISSUE_AGENT_PUSHOVER_APP_TOKEN || "",
     pushoverUserKey: env.ISSUE_AGENT_PUSHOVER_USER_KEY || "",
     slackEnabled: truthy(env.ISSUE_AGENT_SLACK_ENABLED, false),
@@ -197,6 +218,26 @@ export async function loadConfig(env = process.env, options = {}) {
     webPort: integer(env.ISSUE_AGENT_WEB_PORT, 6983, 1),
     webUsername: env.ISSUE_AGENT_WEB_USERNAME || "operator",
     webPassword: env.ISSUE_AGENT_WEB_PASSWORD || ""
+  };
+
+  const codexEnvironment = {};
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_MODEL")) codexEnvironment.model = config.codexModel;
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_REASONING_EFFORT")) codexEnvironment.reasoningEffort = config.codexReasoningEffort;
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_FAST_MODE")) codexEnvironment.fastMode = config.codexFastMode;
+  if (hasEnvValue(env, "ISSUE_AGENT_CODEX_SERVICE_TIER") || hasEnvValue(env, "ISSUE_AGENT_CODEX_FAST_MODE")) {
+    codexEnvironment.serviceTier = config.codexServiceTier;
+  }
+  if (hasEnvValue(env, "ISSUE_AGENT_REPAIR_CONTEXT")) codexEnvironment.repairContext = config.repairContext;
+
+  const operationsEnvironment = {};
+  if (hasEnvValue(env, "ISSUE_AGENT_POLL_INTERVAL_SECONDS")) operationsEnvironment.pollIntervalSeconds = config.pollIntervalSeconds;
+  if (hasEnvValue(env, "ISSUE_AGENT_SNAPSHOT_RETENTION")) operationsEnvironment.snapshotRetention = config.issueSnapshotRetention;
+  if (hasEnvValue(env, "ISSUE_AGENT_SERVER_OWNER_REPORTER_USERNAME")) {
+    operationsEnvironment.serverOwnerReporterUsername = config.serverOwnerReporterUsername;
+  }
+  config.legacySettingsEnvironment = {
+    codex: codexEnvironment,
+    operations: operationsEnvironment
   };
 
   if (!config.mediaMcpBearerToken) {
