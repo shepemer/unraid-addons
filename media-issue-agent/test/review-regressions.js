@@ -92,6 +92,59 @@ async function writeExecutable(file, source) {
   return file;
 }
 
+async function testCodexFailuresPreserveBothStreams() {
+  const root = await tempDir();
+  try {
+    const codexHome = await createAuthHome(root);
+    const fatal = "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.";
+    const warning = "WARNING: failed to clean up stale arg0 temp dirs: Directory not empty (os error 39)";
+    const codexBin = await writeExecutable(path.join(root, "codex-failed.mjs"), [
+      "#!/usr/bin/env node",
+      "import { readFileSync, writeSync } from 'node:fs';",
+      "readFileSync(0, 'utf8');",
+      "writeSync(1, 'x'.repeat(30_000) + '\\n');",
+      `writeSync(1, JSON.stringify({type: 'turn.failed', error: {message: ${JSON.stringify(fatal)}}}) + '\\n');`,
+      "writeSync(1, JSON.stringify({type: 'item.completed', item: {type: 'command_execution', aggregated_output: JSON.stringify({password:'fixture-nested-secret',token:'fixture-nested-token'})}}) + '\\n');",
+      "writeSync(1, 'stdout api_key=fixture-output-secret\\n');",
+      `writeSync(2, ${JSON.stringify(warning)} + '\\n');`,
+      "writeSync(2, 'stderr password=fixture-error-secret\\n');",
+      "process.exitCode = 1;"
+    ].join("\n"));
+    const config = { ...configFor(root, codexHome, codexBin), codexTimeoutMs: 5000 };
+    for (const run of [
+      () => runCodex(config, "fixture failed analysis"),
+      () => runCodexRepair(config, "fixture failed repair")
+    ]) {
+      await assert.rejects(run, error => {
+        assert.match(error.message.split("\n")[0], /exited with 1:.*not supported/);
+        assert.ok(error.message.includes(fatal));
+        assert.ok(error.message.includes(warning));
+        assert.match(error.message, /stdout \(tail; truncated\):/);
+        assert.match(error.message, /stderr:/);
+        assert.match(error.message, /stdout API_KEY=\[REDACTED\]/);
+        assert.match(error.message, /stderr password=\[REDACTED\]/);
+        assert.ok(!error.message.includes("fixture-output-secret"));
+        assert.ok(!error.message.includes("fixture-error-secret"));
+        assert.ok(!error.message.includes("fixture-nested-secret"));
+        assert.ok(!error.message.includes("fixture-nested-token"));
+        assert.ok(error.message.length < 29_000, "Failure diagnostics must be bounded");
+        return true;
+      });
+    }
+    await writeExecutable(codexBin, [
+      "#!/usr/bin/env node",
+      "import { readFileSync, writeSync } from 'node:fs';",
+      "readFileSync(0, 'utf8');",
+      `writeSync(2, ${JSON.stringify(warning)});`,
+      "writeSync(1, JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'Fixture success'}}) + '\\n');"
+    ].join("\n"));
+    assert.equal(await runCodex(config, "fixture successful analysis"), "Fixture success");
+    assert.equal((await runCodexRepair(config, "fixture successful repair")).finalMessage, "Fixture success");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function withServer(handler, callback) {
   const server = http.createServer(handler);
   await new Promise((resolve, reject) => {
@@ -627,6 +680,7 @@ async function testDurableIssueLogPaginationAndLiveCursor() {
 }
 
 async function run() {
+  await testCodexFailuresPreserveBothStreams();
   await testInvestigationFailuresRemainRetryableWithoutApprovals();
   await testApprovalStateChangesAreTransactional();
   await testConcurrentPollsSharePaginationAndPreserveActiveState();

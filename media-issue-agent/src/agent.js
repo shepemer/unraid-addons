@@ -66,7 +66,7 @@ import {
   runCodexWorkflowImprovementAnalysis,
   steeredInvestigationPrompt
 } from "./codex.js";
-import { inspectCodexAuth, validateCodexHome } from "./config.js";
+import { DEFAULT_CODEX_MODEL, defaultCodexReasoningEffort, inspectCodexAuth, migrateRetiredCodexSettings, validateCodexHome } from "./config.js";
 import { AUTOMATED_SUFFIX, CLOSED_MARKER, REOPENED_MARKER, countCharacters, validateDraftComment } from "./comments.js";
 import { redactText, sanitizeValue } from "./redact.js";
 import { createDiagnosticLogger } from "./diagnostic-log.js";
@@ -1674,14 +1674,17 @@ function publicImprovementItem(item) {
   };
 }
 
-const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 
 function normalizeCodexSettings(values = {}, defaults = {}) {
-  const model = String(values.model ?? defaults.model ?? "gpt-5.5").trim();
+  const model = String(values.model ?? defaults.model ?? DEFAULT_CODEX_MODEL).trim();
   if (!model || model.length > 120) {
     throw new Error("Codex model must be a non-empty string.");
   }
-  const reasoningEffort = String(values.reasoningEffort ?? defaults.reasoningEffort ?? "xhigh").trim();
+  const defaultReasoning = values.model && values.model !== defaults.model
+    ? defaultCodexReasoningEffort(model)
+    : defaults.reasoningEffort ?? defaultCodexReasoningEffort(model);
+  const reasoningEffort = String(values.reasoningEffort ?? defaultReasoning).trim();
   if (!REASONING_EFFORTS.has(reasoningEffort)) {
     throw new Error(`Unsupported Codex reasoning effort ${reasoningEffort}`);
   }
@@ -1694,7 +1697,7 @@ function normalizeCodexSettings(values = {}, defaults = {}) {
   if (repairContext.length > 4000) {
     throw new Error("Repair context is too long.");
   }
-  return { model, reasoningEffort, fastMode, serviceTier, repairContext };
+  return migrateRetiredCodexSettings({ model, reasoningEffort, fastMode, serviceTier, repairContext });
 }
 
 function closeActionsFor(source, issueId, message) {
@@ -2089,6 +2092,16 @@ export class MediaIssueAgent {
         await initDb(this.config.dbPath);
         if (this.config.webEnabled) {
           await this.diagnosticLogger.loadHistory();
+        }
+        const savedCodexSettings = getSetting(this.config.dbPath, "codex", null);
+        const migratedCodexSettings = migrateRetiredCodexSettings(savedCodexSettings);
+        if (migratedCodexSettings !== savedCodexSettings) {
+          setSetting(this.config.dbPath, "codex", migratedCodexSettings);
+          this.diagnostic("info", "codex_retired_model_migrated", {
+            previousModel: savedCodexSettings.model,
+            model: migratedCodexSettings.model,
+            reasoningEffort: migratedCodexSettings.reasoningEffort
+          });
         }
         const recovered = recoverInterruptedAgentRuns(this.config.dbPath, {
           staleSeconds: this.config.recoverStaleRunSeconds
@@ -2749,13 +2762,13 @@ export class MediaIssueAgent {
   }
 
   codexSettings() {
-    const defaults = {
-      model: this.config.codexModel || "gpt-5.5",
-      reasoningEffort: this.config.codexReasoningEffort || "xhigh",
+    const defaults = migrateRetiredCodexSettings({
+      model: this.config.codexModel || DEFAULT_CODEX_MODEL,
+      reasoningEffort: this.config.codexReasoningEffort || defaultCodexReasoningEffort(this.config.codexModel),
       fastMode: this.config.codexFastMode !== false,
       serviceTier: this.config.codexServiceTier || (this.config.codexFastMode === false ? "" : "fast"),
       repairContext: this.config.repairContext || ""
-    };
+    });
     const saved = getSetting(this.config.dbPath, "codex", null);
     return {
       defaults,
@@ -3696,13 +3709,16 @@ export class MediaIssueAgent {
     }
     let summary;
     try {
+      const settings = this.codexSettings().effective;
       this.diagnostic("info", "codex_investigation_started", { jobId: job.id });
       summary = await runCodex(this.config, investigationPrompt(evidence, {
         trustedReporterGuidance: ownerGuidance
       }), {
+        settings,
         onEvent: event => this.recordCodexTokenUsage(event, {
           jobId: job.id,
-          source: "investigation"
+          source: "investigation",
+          settings
         })
       });
       this.diagnostic("info", "codex_investigation_completed", {
@@ -3852,13 +3868,16 @@ export class MediaIssueAgent {
     });
     let summary;
     try {
+      const settings = this.codexSettings().effective;
       this.diagnostic("info", "codex_steered_investigation_started", { jobId });
       summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage, {
         trustedReporterGuidance: trustedReporterGuidanceFromEvidence(evidence)
       }), {
+        settings,
         onEvent: event => this.recordCodexTokenUsage(event, {
           jobId,
-          source: "steered_investigation"
+          source: "steered_investigation",
+          settings
         })
       });
       this.diagnostic("info", "codex_steered_investigation_completed", {
@@ -4591,11 +4610,14 @@ export class MediaIssueAgent {
     if (!draft) {
       await validateCodexHome(this.config.codexHome);
       try {
+        const settings = this.codexSettings().effective;
         draft = await runCodex(this.config, commentDraftPrompt(evidence), {
+          settings,
           onEvent: event => this.recordCodexTokenUsage(event, {
             jobId,
             agentRunId: executionResult?.agentRunId,
-            source: "comment_draft"
+            source: "comment_draft",
+            settings
           })
         });
       } catch (error) {

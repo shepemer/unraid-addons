@@ -1080,13 +1080,14 @@ export class SlackService {
         await this.processInbound(item);
         completeSlackInbound(this.dbPath, item.eventId);
       } catch (error) {
-        const message = compact(redactText(error.message), 500);
+        const diagnosticError = redactText(error.message);
+        const message = compact(diagnosticError, 500);
         if (Number(item.attempts || 0) < 3) {
           retrySlackInbound(this.dbPath, item.eventId, message, 2 ** Number(item.attempts || 1));
         } else {
           completeSlackInbound(this.dbPath, item.eventId, "failed", message);
           await this.enqueueThreadReply(item, "processing_failed", `processing-failed:${item.eventId}`,
-            "I could not process that message safely. Please try again in a new message.",
+            "I ran into an internal processing error. Please try again shortly.",
             { trustedTemplate: true });
         }
         this.agent.diagnostic("error", "slack_message_processing_failed", {
@@ -1094,7 +1095,7 @@ export class SlackService {
           threadId: item.threadId,
           slackIssueId: item.slackIssueId || null,
           attempts: item.attempts,
-          error: message
+          error: diagnosticError
         });
       }
     }
@@ -1345,7 +1346,7 @@ export class SlackService {
             contentDigest,
             errorCode: String(error?.code || "request_failed")
           });
-          safeMessage = outboundModerationFallback();
+          safeMessage = moderationErrorSlackResponse();
         }
       }
     }

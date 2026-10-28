@@ -217,7 +217,7 @@ export function blockedSlackResponse(category) {
 }
 
 export function moderationErrorSlackResponse() {
-  return "I cannot safely process that message right now. Please try again shortly.";
+  return "The message-checking service is unavailable right now. Please try again shortly.";
 }
 
 export function outboundModerationFallback(category = "") {
