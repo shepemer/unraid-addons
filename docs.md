@@ -588,6 +588,8 @@ The Docker workflow separates validation from release promotion:
 - Pushing a Git tag named `v*`, such as `v0.2.0`, builds, scans, and pushes that version tag plus the full commit SHA tag.
 - Manual workflow runs promote a chosen Git ref to either `:beta` or `:latest`.
 
+Published images use Docker schema 2 manifests because released Unraid update checkers do not accept individual OCI manifests. The workflow verifies every published tag with Unraid's registry request headers and requires an update digest, so a successful publication also confirms update detection compatibility.
+
 Use these image channels:
 
 - `:beta` for preview installs you control.
