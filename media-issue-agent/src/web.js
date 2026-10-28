@@ -50,6 +50,8 @@ const HTML = `<!doctype html>
               <option value="medium">Medium</option>
               <option value="high">High</option>
               <option value="xhigh">Very High</option>
+              <option value="max">Max</option>
+              <option value="ultra">Ultra</option>
             </select>
           </label>
           <label class="compact-toggle">
@@ -3637,7 +3639,8 @@ function renderAuth(auth, login) {
 }
 
 function displayModelName(value) {
-  const model = String(value || "gpt-5.5").trim();
+  const model = String(value || "gpt-6-astra").trim();
+  if (model === "gpt-6-astra") return "GPT-6 Astra";
   return model.replace(/^gpt/i, "GPT");
 }
 
@@ -3647,16 +3650,18 @@ function displayReasoningEffort(value) {
     low: "Low",
     medium: "Medium",
     high: "High",
-    xhigh: "Very High"
+    xhigh: "Very High",
+    max: "Max",
+    ultra: "Ultra"
   };
-  return labels[String(value || "xhigh")] || String(value || "Very High");
+  return labels[String(value || "ultra")] || String(value || "Ultra");
 }
 
 function renderCodexSettings(settings) {
   state.codexSettings = settings || null;
   const effective = settings?.effective || settings?.defaults || {};
-  el.codexModel.value = effective.model || "gpt-5.5";
-  el.codexReasoning.value = effective.reasoningEffort || "xhigh";
+  el.codexModel.value = effective.model || "gpt-6-astra";
+  el.codexReasoning.value = effective.reasoningEffort || "ultra";
   el.codexFastMode.checked = effective.fastMode !== false;
   el.codexServiceTier.value = effective.serviceTier || "";
   el.codexRepairContext.value = effective.repairContext || "";

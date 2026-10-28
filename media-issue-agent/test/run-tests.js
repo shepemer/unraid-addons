@@ -11,6 +11,7 @@ import {
   createAgentRun,
   ensureJob,
   extractTokenUsageFromCodexEvent,
+  getSetting,
   initDb,
   insertSnapshot,
   investigationForJob,
@@ -23,6 +24,7 @@ import {
   issueLogRecords,
   snapshotEntries,
   snapshotEntry,
+  setSetting,
   statusSummary,
   supersedePendingApprovals,
   transitionJob,
@@ -72,14 +74,16 @@ async function authHome(authJson = {
 
 async function fakeCodexBin() {
   const dir = await tempDir();
-  const bin = path.join(dir, "codex-fixture");
+  const bin = path.join(dir, "codex-fixture.mjs");
   await writeFile(bin, [
-    "#!/bin/sh",
-    "cat >/dev/null",
-    "printf '%s\\n' 'Fixture automated update.' 'Automated response from Codex.'"
+    "#!/usr/bin/env node",
+    "import { appendFileSync, readFileSync } from 'node:fs';",
+    "readFileSync(0, 'utf8');",
+    "appendFileSync(new URL('./invocations.jsonl', import.meta.url), JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "process.stdout.write('Fixture automated update.\\nAutomated response from Codex.\\n');"
   ].join("\n"));
   await chmod(bin, 0o700);
-  return { dir, bin };
+  return { dir, bin, logPath: path.join(dir, "invocations.jsonl") };
 }
 
 async function testPlexClosedFilter() {
@@ -644,9 +648,12 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
     codexBin: fakeCodex.bin,
     codexWorkspace: path.join(dir, "codex-workspace"),
     codexTimeoutMs: 10000,
+    codexModel: "different-configured-model",
+    codexReasoningEffort: "high",
     dryRun: true
   }, client);
   await agent.init();
+  agent.updateCodexSettings({ model: "gpt-6-astra", reasoningEffort: "ultra", fastMode: true, serviceTier: "fast" });
   const entries = [{
     source: "seerr",
     issueId: "1",
@@ -711,6 +718,14 @@ async function testApprovedJobContinuesToDryRunCommentPosting() {
   assert.equal(commentCalls[1].args.message, "Closed.");
   const resolveCall = calls.find(call => call.name === "seerr_resolve_issue");
   assert.equal(resolveCall.args.dryRun, false);
+  const invocations = (await readFile(fakeCodex.logPath, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(invocations.length >= 4, "investigation, both steering runs, and draft must use saved runner settings");
+  for (const args of invocations) {
+    assert.equal(args[args.indexOf("--model") + 1], "gpt-6-astra");
+    assert.ok(args.includes('model_reasoning_effort="ultra"'));
+    assert.ok(args.includes("features.fast_mode=true"));
+    assert.ok(args.includes('service_tier="fast"'));
+  }
 
   await rm(dir, { recursive: true, force: true });
   await rm(codexHome, { recursive: true, force: true });
@@ -2353,8 +2368,8 @@ function testRepairCodexArgs() {
     codexServiceTier: "fast"
   });
   assert.deepEqual(settings, {
-    model: "gpt-5.5",
-    reasoningEffort: "xhigh",
+    model: "gpt-6-astra",
+    reasoningEffort: "ultra",
     fastMode: true,
     serviceTier: "fast"
   });
@@ -2364,8 +2379,9 @@ function testRepairCodexArgs() {
   assert.ok(args.includes("--skip-git-repo-check"));
   assert.ok(args.includes("--ephemeral"));
   assert.ok(args.includes("--model"));
-  assert.ok(args.includes("gpt-5.5"));
-  assert.ok(args.includes('model_reasoning_effort="xhigh"'));
+  assert.ok(args.includes("gpt-6-astra"));
+  assert.equal(args.includes("gpt-5.5"), false);
+  assert.ok(args.includes('model_reasoning_effort="ultra"'));
   assert.ok(args.includes("features.fast_mode=true"));
   assert.ok(args.includes('service_tier="fast"'));
   assert.ok(args.includes('mcp_servers.media.url="http://media-mcp.invalid/mcp"'));
@@ -2379,6 +2395,22 @@ function testRepairCodexArgs() {
   }, {}, { outputLastMessagePath: "/tmp/last-message.json" });
   assert.ok(withOutput.args.includes("--output-last-message"));
   assert.ok(withOutput.args.includes("/tmp/last-message.json"));
+  assert.deepEqual(withOutput.settings, {
+    model: "gpt-6-astra",
+    reasoningEffort: "ultra",
+    fastMode: true,
+    serviceTier: "fast"
+  });
+  const customized = buildRepairCodexArgs({
+    codexWorkspace: "/tmp/media-agent-workspace",
+    mediaMcpUrl: "http://media-mcp.invalid/mcp"
+  }, { model: "gpt-6-sol", reasoningEffort: "high", fastMode: false, serviceTier: "" });
+  assert.deepEqual(customized.settings, {
+    model: "gpt-6-sol", reasoningEffort: "high", fastMode: false, serviceTier: ""
+  });
+  assert.ok(customized.args.includes("gpt-6-sol"));
+  assert.ok(customized.args.includes('model_reasoning_effort="high"'));
+  assert.equal(customized.args.includes("features.fast_mode=true"), false);
 }
 
 function testCodexEnvAndPromptHardening() {
@@ -2678,7 +2710,8 @@ async function testCodexSettingsPersist() {
     repairContext: "Default repair context."
   }, {});
   await agent.init();
-  assert.equal(agent.codexSettings().effective.model, "gpt-5.5");
+  assert.equal(agent.codexSettings().effective.model, "gpt-6-astra");
+  assert.equal(agent.codexSettings().effective.reasoningEffort, "ultra");
   assert.equal(agent.codexSettings().effective.repairContext, "Default repair context.");
   const saved = agent.updateCodexSettings({
     model: "gpt-5",
@@ -2707,7 +2740,99 @@ async function testCodexSettingsPersist() {
     async () => agent.updateCodexSettings({ model: "gpt-5", reasoningEffort: "extreme" }),
     /Unsupported Codex reasoning effort/
   );
+  for (const reasoningEffort of ["max", "ultra"]) {
+    const astra = agent.updateCodexSettings({ model: "gpt-6-astra", reasoningEffort, fastMode: true, serviceTier: "fast" });
+    assert.equal(astra.effective.reasoningEffort, reasoningEffort);
+    assert.equal(getSetting(dbPath, "codex").reasoningEffort, reasoningEffort);
+    assert.equal(astra.effective.fastMode, true);
+    assert.equal(astra.effective.serviceTier, "fast");
+  }
   await rm(dir, { recursive: true, force: true });
+}
+
+async function testRetiredCodexSettingsMigration() {
+  const configBase = { ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN: "fixture-token" };
+  const options = { requireCodexAuth: false };
+  const defaults = await loadConfig(configBase, options);
+  assert.equal(defaults.codexModel, "gpt-6-astra");
+  assert.equal(defaults.codexReasoningEffort, "ultra");
+  assert.equal(defaults.codexFastMode, true);
+  assert.equal(defaults.codexServiceTier, "fast");
+  const legacyEnv = await loadConfig({
+    ...configBase,
+    ISSUE_AGENT_CODEX_MODEL: "gpt-5.5",
+    ISSUE_AGENT_CODEX_REASONING_EFFORT: "xhigh",
+    ISSUE_AGENT_CODEX_FAST_MODE: "false"
+  }, options);
+  assert.equal(legacyEnv.codexModel, "gpt-6-astra");
+  assert.equal(legacyEnv.codexReasoningEffort, "ultra");
+  assert.equal(legacyEnv.codexFastMode, false);
+  assert.equal(legacyEnv.codexServiceTier, "");
+  const legacyCustomReasoning = await loadConfig({
+    ...configBase,
+    ISSUE_AGENT_CODEX_MODEL: "gpt-5.5",
+    ISSUE_AGENT_CODEX_REASONING_EFFORT: "high"
+  }, options);
+  assert.equal(legacyCustomReasoning.codexModel, "gpt-6-astra");
+  assert.equal(legacyCustomReasoning.codexReasoningEffort, "high");
+  const customModel = await loadConfig({
+    ...configBase,
+    ISSUE_AGENT_CODEX_MODEL: "gpt-6-sol",
+    ISSUE_AGENT_CODEX_REASONING_EFFORT: "xhigh"
+  }, options);
+  assert.equal(customModel.codexModel, "gpt-6-sol");
+  assert.equal(customModel.codexReasoningEffort, "xhigh");
+  const customModelWithoutEffort = await loadConfig({
+    ...configBase,
+    ISSUE_AGENT_CODEX_MODEL: "gpt-6-sol"
+  }, options);
+  assert.equal(customModelWithoutEffort.codexModel, "gpt-6-sol");
+  assert.equal(customModelWithoutEffort.codexReasoningEffort, "xhigh");
+
+  const dir = await tempDir();
+  const dbPath = path.join(dir, "state.sqlite");
+  try {
+    await initDb(dbPath);
+    const saved = {
+      model: "gpt-5.5", reasoningEffort: "xhigh", fastMode: false,
+      serviceTier: "", repairContext: "Preserve the operator's repair context."
+    };
+    setSetting(dbPath, "codex", saved);
+    const config = { ...defaults, dbPath, logPath: path.join(dir, "agent.log"), webEnabled: false, suppressInitLog: true };
+    const agent = new MediaIssueAgent(config, {});
+    await agent.init();
+    const migrated = { ...saved, model: "gpt-6-astra", reasoningEffort: "ultra" };
+    assert.deepEqual(agent.codexSettings().effective, migrated);
+    assert.deepEqual(getSetting(dbPath, "codex"), migrated);
+
+    const restarted = new MediaIssueAgent(config, {});
+    await restarted.init();
+    assert.deepEqual(restarted.codexSettings().saved, migrated);
+
+    for (const custom of [
+      { ...saved, model: "gpt-6-sol" },
+      { ...saved, model: "gpt-5.5-custom" },
+      { ...saved, model: "gpt-6-astra", reasoningEffort: "high" }
+    ]) {
+      setSetting(dbPath, "codex", custom);
+      const customAgent = new MediaIssueAgent(config, {});
+      await customAgent.init();
+      assert.deepEqual(customAgent.codexSettings().effective, custom);
+      assert.deepEqual(getSetting(dbPath, "codex"), custom);
+    }
+    setSetting(dbPath, "codex", { model: "gpt-6-sol" });
+    const customWithoutEffort = new MediaIssueAgent(config, {});
+    await customWithoutEffort.init();
+    assert.equal(customWithoutEffort.codexSettings().effective.model, "gpt-6-sol");
+    assert.equal(customWithoutEffort.codexSettings().effective.reasoningEffort, "xhigh");
+    setSetting(dbPath, "codex", { ...saved, reasoningEffort: "high" });
+    const customEffort = new MediaIssueAgent(config, {});
+    await customEffort.init();
+    assert.equal(customEffort.codexSettings().effective.model, "gpt-6-astra");
+    assert.equal(customEffort.codexSettings().effective.reasoningEffort, "high");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 async function testJobListPrioritizesActiveWork() {
@@ -3498,6 +3623,7 @@ async function run() {
   await testStartupDoesNotRecoverLiveOwnerStaleRepairRun();
   await testStartupRecoversStaleInterruptedRepairRun();
   await testCodexSettingsPersist();
+  await testRetiredCodexSettingsMigration();
   await testJobListPrioritizesActiveWork();
   await testDiagnosticLogRedactionAndRangeFiltering();
   await testDiagnosticLogWriteFailureIsReported();

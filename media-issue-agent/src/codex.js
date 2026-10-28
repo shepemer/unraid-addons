@@ -5,8 +5,47 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { redactText, sanitizeValue } from "./redact.js";
+import { DEFAULT_CODEX_MODEL, defaultCodexReasoningEffort, migrateRetiredCodexSettings } from "./config.js";
 
 const MAX_CODEX_CAPTURE_CHARS = 2 * 1024 * 1024;
+const MAX_CODEX_ERROR_STREAM_CHARS = 12_000;
+
+function sanitizeCodexStream(value) {
+  return String(value).split(/\r?\n/).map(line => {
+    const event = safeJsonLine(line.trim());
+    // Decode JSON before redaction so escaped secrets inside tool output are
+    // checked as text, and structured credential fields are scrubbed too.
+    return event ? JSON.stringify(sanitizeValue(event)) : redactText(line);
+  }).join("\n");
+}
+
+function codexProcessError(label, code, stdout, stderr) {
+  // Codex emits fatal API errors as JSON on stdout, while stderr may contain
+  // only an unrelated startup/cleanup warning. Keep both and lead with the
+  // final structured error so compact queue summaries retain the useful cause.
+  let lastFailure = "";
+  let lastError = "";
+  for (const line of stdout.split(/\r?\n/)) {
+    const event = safeJsonLine(line.trim());
+    if (event?.type === "turn.failed" && event.error?.message) {
+      lastFailure = event.error.message;
+    } else if (event?.type === "error" && event.message) {
+      lastError = event.message;
+    } else if (event?.item?.type === "error" && event.item.message) {
+      lastError = event.item.message;
+    }
+  }
+  const summary = sanitizeCodexStream(lastFailure || lastError).slice(0, 4000);
+  const parts = [`${label} exited with ${code}${summary ? `: ${summary}` : ""}`];
+  for (const [name, value] of [["stdout", stdout], ["stderr", stderr]]) {
+    const sanitized = sanitizeCodexStream(value).trim();
+    if (sanitized) {
+      const truncated = sanitized.length > MAX_CODEX_ERROR_STREAM_CHARS;
+      parts.push(`${name}${truncated ? " (tail; truncated)" : ""}:\n${sanitized.slice(-MAX_CODEX_ERROR_STREAM_CHARS)}`);
+    }
+  }
+  return new Error(parts.join("\n"));
+}
 
 function appendBounded(current, chunk, maxChars = MAX_CODEX_CAPTURE_CHARS) {
   const combined = `${current}${chunk}`;
@@ -104,7 +143,7 @@ function runProcess(command, args, options) {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
-        reject(new Error(`Codex exited with ${code}: ${stderr || stdout}`));
+        reject(codexProcessError("Codex", code, stdout, stderr));
       }
     });
   });
@@ -552,13 +591,14 @@ function tomlValue(value) {
 }
 
 function codexRepairSettings(config, overrides = {}) {
-  const fastMode = overrides.fastMode ?? config.codexFastMode;
-  return {
-    model: overrides.model ?? config.codexModel ?? "gpt-5.5",
-    reasoningEffort: overrides.reasoningEffort ?? config.codexReasoningEffort ?? "xhigh",
+  const fastMode = overrides.fastMode ?? config.codexFastMode ?? true;
+  const model = overrides.model ?? config.codexModel ?? DEFAULT_CODEX_MODEL;
+  return migrateRetiredCodexSettings({
+    model,
+    reasoningEffort: overrides.reasoningEffort ?? config.codexReasoningEffort ?? defaultCodexReasoningEffort(model),
     fastMode: Boolean(fastMode),
     serviceTier: overrides.serviceTier ?? config.codexServiceTier ?? (fastMode ? "fast" : "")
-  };
+  });
 }
 
 export function buildRepairCodexArgs(config, settings = {}, options = {}) {
@@ -1078,7 +1118,7 @@ export async function runCodexRepair(config, prompt, settings = {}, hooks = {}) 
           return;
         }
         if (code !== 0) {
-          reject(new Error(`Codex repair exited with ${code}: ${stderr || stdout}`));
+          reject(codexProcessError("Codex repair", code, stdout, stderr));
           return;
         }
         let outputFileMessage = "";

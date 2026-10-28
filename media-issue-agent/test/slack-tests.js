@@ -1491,6 +1491,77 @@ async function testIssueCreationRetryIsIdempotent() {
   }
 }
 
+async function testClassifierFailureReportsInternalErrorAfterModerationAllows() {
+  const root = await tempDir();
+  try {
+    const config = baseConfig(root);
+    await initDb(config.dbPath);
+    const moderationClient = new FakeModerationClient();
+    const diagnostics = [];
+    let classifierCalls = 0;
+    const executionError = [
+      "Codex exited with 1:",
+      "stderr:",
+      "WARNING: stale temporary directory cleanup failed. ".repeat(30),
+      "api_key=sk-private-classifier-error-fixture",
+      "stdout:",
+      '{"error":"The configured model is unavailable."}'
+    ].join("\n");
+    const service = new SlackService({
+      fetch: globalThis.fetch,
+      diagnostic(level, event, payload) {
+        diagnostics.push({ level, event, payload });
+        if (event === "slack_message_processing_failed") {
+          if (payload.attempts < 3) {
+            sqliteExec(config.dbPath, `
+UPDATE slack_event_receipts
+SET available_at = '2000-01-01T00:00:00.000Z'
+WHERE event_id = 'EV-CLASSIFIER-FAILURE';
+`);
+          } else {
+            service.running = false;
+          }
+        }
+      },
+      async classifySlackIntent() {
+        classifierCalls += 1;
+        throw new Error(executionError);
+      }
+    }, config, { transport: new FakeSlackTransport(), moderationClient });
+    service.botUserId = "B-BOT";
+    service.teamId = "T-FIXTURE";
+    await service.ingestEnvelope(envelope({
+      eventId: "EV-CLASSIFIER-FAILURE",
+      ts: "4.500",
+      text: "<@B-BOT> Is Plex online?"
+    }));
+    service.running = true;
+    await service.inboundWorker();
+
+    assert.equal(classifierCalls, 3);
+    assert.equal(moderationClient.calls.length, 1, "Retries reuse approval and the failure reply is trusted.");
+    assert.equal(slackModerationDecisions(config.dbPath, 10)[0].verdict, "allow");
+    const failures = diagnostics.filter(entry => entry.event === "slack_message_processing_failed");
+    assert.deepEqual(failures.map(entry => entry.payload.attempts), [1, 2, 3]);
+    assert.ok(failures.every(entry => entry.payload.error === redactText(executionError)));
+    assert.match(failures[2].payload.error, /stdout:\n.*configured model is unavailable/);
+    assert.doesNotMatch(failures[2].payload.error, /sk-private-classifier-error-fixture/);
+    const receipt = sqliteExec(config.dbPath, `
+SELECT status, attempts, error FROM slack_event_receipts WHERE event_id = 'EV-CLASSIFIER-FAILURE';
+`, { json: true })[0];
+    assert.equal(receipt.status, "failed");
+    assert.equal(receipt.attempts, 3);
+    assert.ok(receipt.error.length <= 500);
+    const replies = sqliteExec(config.dbPath, "SELECT kind, message FROM slack_outbox;", { json: true });
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].kind, "processing_failed");
+    assert.match(replies[0].message, /internal processing error/i);
+    assert.doesNotMatch(replies[0].message, /safe|content|rephrase|configured model|sk-private/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testSlackQueueRecoveryOnlyRunsAtSlackStartup() {
   const root = await tempDir();
   try {
@@ -1834,6 +1905,11 @@ ORDER BY id;
     assert.equal(sqliteExec(config.dbPath, "SELECT COUNT(*) AS count FROM slack_moderation_pending;", {
       json: true
     })[0].count, 0);
+    const inboundModerationError = sqliteExec(config.dbPath, `
+SELECT message FROM slack_outbox WHERE dedupe_key = 'moderation:error:EV-MOD-ERROR';
+`, { json: true })[0];
+    assert.match(inboundModerationError.message, /service is unavailable/i);
+    assert.doesNotMatch(inboundModerationError.message, /safe|content|rephrase/i);
 
     const outbound = await service.enqueueThreadReply({
       slackIssueId: null,
@@ -1851,6 +1927,14 @@ ORDER BY id;
     }, "conversation", "secret-outbound-fixture", "api_key=sk-private-draft-fixture");
     assert.match(secretOutbound.message, /could not safely send the drafted response/i);
     assert.equal(moderationClient.calls.length, moderationCallsBeforeSecretDraft);
+    const unavailableOutbound = await service.enqueueThreadReply({
+      slackIssueId: null,
+      threadId: 1,
+      channelId: "C-ISSUES",
+      rootTs: "20.000"
+    }, "conversation", "unavailable-outbound-fixture", "moderation outage fixture");
+    assert.match(unavailableOutbound.message, /service is unavailable/i);
+    assert.doesNotMatch(unavailableOutbound.message, /safe|content|rephrase/i);
 
     const decisions = slackModerationDecisions(config.dbPath, 20);
     assert.equal(decisions.find(decision => decision.referenceKey === "EV-MOD-SAFE").verdict, "allow");
@@ -1864,6 +1948,7 @@ ORDER BY id;
     assert.equal(errorDecision.errorCode, null);
     assert.equal(decisions.find(decision => decision.referenceKey === "unsafe-outbound-fixture").verdict, "block");
     assert.equal(decisions.find(decision => decision.referenceKey === "secret-outbound-fixture").category, "exposed_secret");
+    assert.equal(decisions.find(decision => decision.referenceKey === "unavailable-outbound-fixture").verdict, "error");
     const status = slackModerationStatus(config.dbPath);
     assert.ok(status.recent.allowed >= 2);
     assert.ok(status.recent.blocked >= 3);
@@ -2008,6 +2093,7 @@ await testSlackMessageWorkflow();
 await testMediaRequestSelectionAndSubmission();
 await testReadOnlyMediaInfoQueries();
 await testIssueCreationRetryIsIdempotent();
+await testClassifierFailureReportsInternalErrorAfterModerationAllows();
 await testSlackQueueRecoveryOnlyRunsAtSlackStartup();
 await testRateAccounting();
 await testModerationPrimitivesAndApiClient();

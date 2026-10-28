@@ -2,6 +2,32 @@ import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { defaultDiagnosticLogPath } from "./diagnostic-log.js";
 
+export const DEFAULT_CODEX_MODEL = "gpt-6-astra";
+export const DEFAULT_CODEX_REASONING_EFFORT = "ultra";
+
+export function defaultCodexReasoningEffort(model) {
+  const selectedModel = String(model || DEFAULT_CODEX_MODEL).trim();
+  return [DEFAULT_CODEX_MODEL, "gpt-5.5", ""].includes(selectedModel)
+    ? DEFAULT_CODEX_REASONING_EFFORT
+    : "xhigh";
+}
+
+// GPT-5.5 was retired for ChatGPT-authenticated Codex on October 14, 2026.
+// Upgrade the former defaults while preserving other operator choices.
+export function migrateRetiredCodexSettings(settings) {
+  if (String(settings?.model || "").trim() !== "gpt-5.5") {
+    return settings;
+  }
+  const reasoningEffort = String(settings.reasoningEffort || "").trim();
+  return {
+    ...settings,
+    model: DEFAULT_CODEX_MODEL,
+    reasoningEffort: !reasoningEffort || reasoningEffort === "xhigh"
+      ? DEFAULT_CODEX_REASONING_EFFORT
+      : reasoningEffort
+  };
+}
+
 function truthy(value, defaultValue = false) {
   if (value === undefined || value === null || value === "") {
     return defaultValue;
@@ -133,6 +159,10 @@ export async function validateCodexHome(codexHome) {
 
 export async function loadConfig(env = process.env, options = {}) {
   assertNoOpenAiApiKeys(env);
+  const codexSettings = migrateRetiredCodexSettings({
+    model: env.ISSUE_AGENT_CODEX_MODEL || DEFAULT_CODEX_MODEL,
+    reasoningEffort: env.ISSUE_AGENT_CODEX_REASONING_EFFORT || defaultCodexReasoningEffort(env.ISSUE_AGENT_CODEX_MODEL)
+  });
   const config = {
     mediaMcpUrl: env.ISSUE_AGENT_MEDIA_MCP_URL || "http://media-mcp:6971/mcp",
     mediaMcpBearerToken: env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN || "",
@@ -156,8 +186,8 @@ export async function loadConfig(env = process.env, options = {}) {
     codexTimeoutMs: integer(env.ISSUE_AGENT_CODEX_TIMEOUT_MS, 120000, 10000),
     codexRepairTimeoutMs: integer(env.ISSUE_AGENT_CODEX_REPAIR_TIMEOUT_MS, 14400000, 10000),
     recoverStaleRunSeconds: integer(env.ISSUE_AGENT_RECOVER_STALE_RUN_SECONDS, 120, 30),
-    codexModel: env.ISSUE_AGENT_CODEX_MODEL || "gpt-5.5",
-    codexReasoningEffort: env.ISSUE_AGENT_CODEX_REASONING_EFFORT || "xhigh",
+    codexModel: codexSettings.model,
+    codexReasoningEffort: codexSettings.reasoningEffort,
     codexFastMode: truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, true),
     codexServiceTier: env.ISSUE_AGENT_CODEX_SERVICE_TIER || (truthy(env.ISSUE_AGENT_CODEX_FAST_MODE, true) ? "fast" : ""),
     codexEnvAllowlist: list(env.ISSUE_AGENT_CODEX_ENV_ALLOWLIST),

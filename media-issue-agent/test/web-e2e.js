@@ -757,7 +757,7 @@ async function testFullBrowserWorkflow(browser) {
     const page = pageHandle.page;
 
     await expect(page.locator("#codex-settings-panel")).toBeHidden();
-    await expect(page.locator("#runner-settings-summary")).toHaveText("GPT-5.5 Very High");
+    await expect(page.locator("#runner-settings-summary")).toHaveText("GPT-6 Astra Ultra");
     await expect(page.locator("#runner-settings-button")).toBeVisible();
     const topbarHeight = await page.locator(".topbar").evaluate(node => node.getBoundingClientRect().height);
     assert.ok(topbarHeight <= 76, `topbar too tall: ${topbarHeight}`);
@@ -1287,11 +1287,18 @@ async function testMobileTriageLayoutAndManualActions(browser) {
     await expect(page.locator("#codex-model")).toBeInViewport();
     await expect(page.locator("#codex-settings-save")).toBeInViewport();
     await expect(page.locator("#runner-settings-close-button")).toBeInViewport();
-    await page.locator("#codex-model").fill("gpt-5.5");
-    await page.locator("#codex-reasoning").selectOption("xhigh");
+    await page.locator("#codex-model").fill("gpt-6-astra");
+    await page.locator("#codex-reasoning").selectOption("ultra");
     await page.locator("#codex-fast-mode").setChecked(true);
     await page.locator("#codex-settings-save").click();
     await expect(page.locator("#toast")).toContainText("Codex settings saved");
+    await expect(page.locator("#runner-settings-summary")).toHaveText("GPT-6 Astra Ultra");
+    await page.reload();
+    await page.locator("#runner-settings-button").click();
+    await expect(page.locator("#codex-model")).toHaveValue("gpt-6-astra");
+    await expect(page.locator("#codex-reasoning")).toHaveValue("ultra");
+    await expect(page.locator("#codex-fast-mode")).toBeChecked();
+    await expect(page.locator("#codex-service-tier")).toHaveValue("fast");
     await page.locator("#runner-settings-close-button").click();
     await expect(page.locator("#app-shell")).not.toHaveClass(/runner-settings-open/);
 
