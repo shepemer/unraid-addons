@@ -184,7 +184,9 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          load: true
+          # Released Unraid update checkers omit single OCI manifests from Accept.
+          # Keep the scanned, locally loaded image in Docker schema 2 format.
+          outputs: type=docker,oci-mediatypes=false
           build-args: ${{ matrix.build_args }}
           tags: ${{ steps.image-tags.outputs.tags }}
           labels: |
@@ -221,6 +223,49 @@ jobs:
           done <<'EOF'
           ${{ steps.image-tags.outputs.tags }}
           EOF
+
+      - name: Verify Unraid update detection
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.image-tags.outputs.tags }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+
+          # Match the Accept header used by released Unraid 7.0-7.3 DockerClient.
+          accept = ",".join([
+              "application/vnd.docker.distribution.manifest.list.v2+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+              "application/vnd.oci.image.index.v1+json",
+          ])
+          for image in os.environ["IMAGE_TAGS"].splitlines():
+              if not image:
+                  continue
+              registry, repository_tag = image.split("/", 1)
+              if registry != "ghcr.io":
+                  raise SystemExit(f"Unsupported registry: {registry}")
+              repository, tag = repository_tag.rsplit(":", 1)
+              query = urllib.parse.urlencode({
+                  "service": registry,
+                  "scope": f"repository:{repository}:pull",
+              })
+              with urllib.request.urlopen(f"https://{registry}/token?{query}", timeout=30) as response:
+                  token = json.load(response)["token"]
+              request = urllib.request.Request(
+                  f"https://{registry}/v2/{repository}/manifests/{tag}",
+                  method="HEAD",
+                  headers={"Accept": accept, "Authorization": f"Bearer {token}"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  digest = response.headers.get("Docker-Content-Digest", "")
+                  if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                      raise SystemExit(f"No valid update digest returned for {image}")
+                  print(f"Unraid update check passed: {image} {digest}")
+          PY
 
   build:
     needs: build-images
