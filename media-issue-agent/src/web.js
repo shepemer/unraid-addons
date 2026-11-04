@@ -2682,6 +2682,7 @@ const JS = `const state = {
   jobs: [],
   activeJobId: null,
   activeJobState: null,
+  abortBusy: false,
   activeJobDetail: null,
   activeEntryIndex: null,
   closeEntryIndex: null,
@@ -3199,8 +3200,10 @@ function closeDetail() {
 function setBusy(value) {
   state.busy = value;
   for (const button of document.querySelectorAll("button:not([data-theme-choice])")) {
-    if (value) {
-      button.disabled = button !== el.abortRepairButton || state.activeJobState !== "executing";
+    if (button === el.abortRepairButton) {
+      syncAbortRepairButton();
+    } else if (value) {
+      button.disabled = true;
     } else if (button === el.loginButton) {
       button.disabled = state.loginRunning || state.authOk;
     } else if (button.dataset.investigate) {
@@ -3209,6 +3212,12 @@ function setBusy(value) {
       button.disabled = false;
     }
   }
+}
+
+function syncAbortRepairButton(detail = null) {
+  const canAbortRepair = (detail?.job?.state || state.activeJobState) === "executing";
+  el.abortRepairButton.classList.toggle("hidden", !canAbortRepair);
+  el.abortRepairButton.disabled = !canAbortRepair || state.abortBusy || !state.authOk;
 }
 
 function applyTheme(theme) {
@@ -5378,9 +5387,7 @@ function updateJobControls(detail) {
   el.approvalActions.classList.toggle("hidden", !canApprove);
   el.continueButton.classList.toggle("hidden", stateName !== "approved_for_execution" && !retryResolutionDraft);
   el.continueButton.textContent = retryResolutionDraft ? "Retry draft" : "Continue";
-  const canAbortRepair = stateName === "executing";
-  el.abortRepairButton.classList.toggle("hidden", !canAbortRepair);
-  el.abortRepairButton.disabled = !canAbortRepair || !state.authOk;
+  syncAbortRepairButton(detail);
   el.reinvestigateJobButton.classList.toggle("hidden", !failedRepair);
   el.reinvestigateJobButton.disabled = !failedRepair || !state.authOk;
   el.closeFailedRepairButton.classList.toggle("hidden", !failedRepair);
@@ -6019,9 +6026,10 @@ async function retrySameRepair() {
 }
 
 async function abortRepair() {
-  if (!state.activeJobId) return;
+  if (!state.activeJobId || state.abortBusy) return;
   const jobId = state.activeJobId;
-  setBusy(true);
+  state.abortBusy = true;
+  syncAbortRepairButton();
   setDetailOpen(true);
   setDetailProcessing(true, "Aborting repair");
   try {
@@ -6043,7 +6051,8 @@ async function abortRepair() {
     el.output.textContent = error.message;
     toast(error.message);
   } finally {
-    setBusy(false);
+    state.abortBusy = false;
+    syncAbortRepairButton();
   }
 }
 

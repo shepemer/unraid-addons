@@ -808,7 +808,7 @@ async function testFullBrowserWorkflow(browser) {
     page.once("dialog", dialog => dialog.accept());
     await page.locator("#codex-settings-reset").click();
     await expect(page.locator("#toast")).toContainText("Codex settings reset");
-    await expect(page.locator("#codex-model")).toHaveValue("gpt-5.5");
+    await expect(page.locator("#codex-model")).toHaveValue("gpt-6-astra");
     await expect(page.locator("#repair-context-button")).toHaveText("Context");
     await page.locator("#runner-settings-close-button").click();
     await expect(page.locator("#codex-settings-panel")).toBeHidden();
@@ -1098,6 +1098,9 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#abort-repair-button")).toBeVisible();
     await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await page.evaluate(() => setBusy(true));
+    await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await page.evaluate(() => setBusy(false));
 
     await page.locator("#detail-close-button").click();
     transitionJob(dbPath, job.id, "executing", "failed_retryable", "Fixture repair stopped after verification failed.");
@@ -1167,6 +1170,28 @@ async function testAbortBecomesAvailableDuringApprovalExecution(browser) {
     await expect(page.locator("#abort-repair-button")).toBeVisible({ timeout: 10_000 });
     await expect(page.locator("#abort-repair-button")).toBeEnabled();
     await expect(page.locator("#detail-processing")).toContainText("Executing repair");
+    let releaseAbort;
+    let abortRequests = 0;
+    const pendingAbort = new Promise(resolve => { releaseAbort = resolve; });
+    await page.route("**/api/jobs/*/abort-repair", async route => {
+      abortRequests += 1;
+      await pendingAbort;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "Fixture abort temporarily unavailable" }) });
+    });
+    try {
+      await page.locator("#abort-repair-button").click();
+      await expect.poll(() => abortRequests).toBe(1);
+      await expect(page.locator("#abort-repair-button")).toBeDisabled();
+      await page.evaluate(() => { setBusy(false); updateJobControls(state.activeJobDetail); });
+      await expect(page.locator("#abort-repair-button")).toBeDisabled();
+      await page.evaluate(() => abortRepair());
+      assert.equal(abortRequests, 1);
+    } finally {
+      releaseAbort();
+    }
+    await expect(page.locator("#toast")).toContainText("Fixture abort temporarily unavailable");
+    await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await page.unroute("**/api/jobs/*/abort-repair");
     await page.locator("#abort-repair-button").click();
     await expect(page.locator("#repair-result-view")).toBeVisible({ timeout: 10_000 });
     await expect(page.locator("#repair-result-summary")).toContainText(/aborted/i);
