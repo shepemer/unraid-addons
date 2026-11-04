@@ -773,6 +773,14 @@ async function testFullBrowserWorkflow(browser) {
     await page.locator("#repair-context-save-button").click();
     await expect(page.locator("#toast")).toContainText("Codex settings saved");
     await expect(page.locator("#repair-context-dialog")).toBeHidden();
+    await expect(page.locator("#operations-poll-interval")).toHaveValue("300");
+    await expect(page.locator("#operations-snapshot-retention")).toHaveValue("200");
+    await page.locator("#operations-poll-interval").fill("45");
+    await page.locator("#operations-snapshot-retention").fill("7");
+    await page.locator("#operations-server-owner-reporter").fill("FixtureOwner, BackupOwner, fixtureowner");
+    page.once("dialog", dialog => dialog.accept());
+    await page.locator("#operations-settings-save").click();
+    await expect(page.locator("#toast")).toContainText("Operations settings saved");
     await page.locator("#runner-settings-close-button").click();
     await expect(page.locator("#codex-settings-panel")).toBeHidden();
     await page.getByRole("button", { name: "Reload" }).click();
@@ -783,10 +791,25 @@ async function testFullBrowserWorkflow(browser) {
     await expect(page.locator("#codex-fast-mode")).not.toBeChecked();
     await expect(page.locator("#runner-settings-summary")).toHaveText("GPT-5 High");
     await expect(page.locator("#repair-context-button")).toHaveText("Context Set");
+    await expect(page.locator("#operations-poll-interval")).toHaveValue("45");
+    await expect(page.locator("#operations-snapshot-retention")).toHaveValue("7");
+    await expect(page.locator("#operations-server-owner-reporter")).toHaveValue("FixtureOwner, BackupOwner");
+    await expect(page.locator("#operations-settings-source")).toContainText("saved");
     await page.locator("#repair-context-button").click();
     await expect(page.locator("#codex-repair-context")).toHaveValue("Prefer exact IDs in browser tests.");
     await page.locator("#repair-context-cancel-button").click();
     await expect(page.locator("#repair-context-dialog")).toBeHidden();
+    page.once("dialog", dialog => dialog.accept());
+    await page.locator("#operations-settings-reset").click();
+    await expect(page.locator("#toast")).toContainText("Operations settings reset");
+    await expect(page.locator("#operations-poll-interval")).toHaveValue("300");
+    await expect(page.locator("#operations-snapshot-retention")).toHaveValue("200");
+    await expect(page.locator("#operations-server-owner-reporter")).toHaveValue("");
+    page.once("dialog", dialog => dialog.accept());
+    await page.locator("#codex-settings-reset").click();
+    await expect(page.locator("#toast")).toContainText("Codex settings reset");
+    await expect(page.locator("#codex-model")).toHaveValue("gpt-6-astra");
+    await expect(page.locator("#repair-context-button")).toHaveText("Context");
     await page.locator("#runner-settings-close-button").click();
     await expect(page.locator("#codex-settings-panel")).toBeHidden();
 
@@ -1075,6 +1098,9 @@ async function testExecutingRepairStatusRendersFromIssueQueue(browser) {
     await expect(page.locator("#detail-band")).toHaveClass(/processing/);
     await expect(page.locator("#abort-repair-button")).toBeVisible();
     await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await page.evaluate(() => setBusy(true));
+    await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await page.evaluate(() => setBusy(false));
 
     await page.locator("#detail-close-button").click();
     transitionJob(dbPath, job.id, "executing", "failed_retryable", "Fixture repair stopped after verification failed.");
@@ -1144,6 +1170,28 @@ async function testAbortBecomesAvailableDuringApprovalExecution(browser) {
     await expect(page.locator("#abort-repair-button")).toBeVisible({ timeout: 10_000 });
     await expect(page.locator("#abort-repair-button")).toBeEnabled();
     await expect(page.locator("#detail-processing")).toContainText("Executing repair");
+    let releaseAbort;
+    let abortRequests = 0;
+    const pendingAbort = new Promise(resolve => { releaseAbort = resolve; });
+    await page.route("**/api/jobs/*/abort-repair", async route => {
+      abortRequests += 1;
+      await pendingAbort;
+      await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "Fixture abort temporarily unavailable" }) });
+    });
+    try {
+      await page.locator("#abort-repair-button").click();
+      await expect.poll(() => abortRequests).toBe(1);
+      await expect(page.locator("#abort-repair-button")).toBeDisabled();
+      await page.evaluate(() => { setBusy(false); updateJobControls(state.activeJobDetail); });
+      await expect(page.locator("#abort-repair-button")).toBeDisabled();
+      await page.evaluate(() => abortRepair());
+      assert.equal(abortRequests, 1);
+    } finally {
+      releaseAbort();
+    }
+    await expect(page.locator("#toast")).toContainText("Fixture abort temporarily unavailable");
+    await expect(page.locator("#abort-repair-button")).toBeEnabled();
+    await page.unroute("**/api/jobs/*/abort-repair");
     await page.locator("#abort-repair-button").click();
     await expect(page.locator("#repair-result-view")).toBeVisible({ timeout: 10_000 });
     await expect(page.locator("#repair-result-summary")).toContainText(/aborted/i);
