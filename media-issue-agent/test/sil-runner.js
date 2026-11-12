@@ -131,7 +131,7 @@ async function startFakeMediaMcp() {
               { name: "bazarr_download_movie_subtitles_for_plex", description: "Download movie subtitles for one Plex rating key." },
               { name: "plex_refresh_metadata", description: "Refresh one Plex rating key." },
               { name: "plex_verify_subtitle_track", description: "Verify a subtitle track by language." },
-              { name: "media_public_library_summary", description: "Return privacy-safe aggregate media library counts." },
+              { name: "media_public_library_summary", description: "Return privacy-safe aggregate media library counts.", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object", properties: {}, additionalProperties: false } },
               { name: "seerr_search_media", description: "Search for movies and television shows." },
               { name: "seerr_request_media", description: "Submit an exact media request." },
               { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." }
@@ -210,7 +210,8 @@ async function startFakeMediaMcp() {
             missingMovieCount: 2,
             sizeOnDiskBytes: 4_000_000_000
           },
-          totalSizeOnDiskBytes: 6_000_000_000
+          totalSizeOnDiskBytes: 6_000_000_000,
+          users: [{ username: "private SIL viewer", email: "viewer@private.example" }]
         };
       } else if (toolName === "seerr_search_media") {
         result = {
@@ -370,6 +371,20 @@ async function createFakeCodexBin(root, logPath) {
     "  const toolText = parsed.result?.content?.[0]?.text;",
     "  return toolText ? JSON.parse(toolText) : parsed.result;",
     "}",
+    "async function callReadOnlyGateway(method, params = {}) {",
+    "  const url = configValue('mcp_servers.media_readonly.url');",
+    "  if (!url || !process.env.SLACK_READ_ONLY_GATEWAY_TOKEN) throw new Error('Missing read-only gateway configuration');",
+    "  if (process.env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN) throw new Error('Read-only research inherited upstream credentials');",
+    "  const response = await fetch(url, {",
+    "    method: 'POST',",
+    "    headers: { authorization: `Bearer ${process.env.SLACK_READ_ONLY_GATEWAY_TOKEN}`, 'content-type': 'application/json' },",
+    "    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params })",
+    "  });",
+    "  const parsed = await response.json();",
+    "  if (parsed.error) throw new Error(parsed.error.message);",
+    "  if (parsed.result?.isError) throw new Error('Read-only gateway tool failed');",
+    "  return parsed.result;",
+    "}",
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
@@ -377,12 +392,34 @@ async function createFakeCodexBin(root, logPath) {
     "if (prompt.includes('Completed media issue workflow improvement analysis.')) kind = 'workflow-improvement';",
     "if (prompt.includes('Investigation prompt improvement implementation audit.')) kind = 'prompt-improvement-check';",
     "if (prompt.includes('Slack message intent classification.')) kind = 'slack-intent';",
-    "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
+    "if (prompt.includes('general read-only research and analysis agent')) kind = 'slack-diagnostics';",
+    "if (prompt.includes('Draft the Slack chat assistant')) kind = 'slack-reply';",
+    "appendFileSync(" + JSON.stringify(logPath) + ", `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",
     "  process.exit(42);",
     "}",
-    "if (kind === 'slack-intent') {",
+    "if (kind === 'slack-diagnostics' || kind === 'slack-reply') {",
+    "  let result;",
+    "  if (kind === 'slack-diagnostics') {",
+    "    const catalog = await callReadOnlyGateway('tools/list');",
+    "    if (!catalog.tools.some(tool => tool.name === 'media_public_library_summary')) throw new Error('Expected aggregate capability missing from live catalog');",
+    "    if (catalog.tools.some(tool => tool.name === 'seerr_request_media')) throw new Error('Mutation capability leaked into research catalog');",
+    "    const response = await callReadOnlyGateway('tools/call', { name: 'media_public_library_summary', arguments: {} });",
+    "    const summary = JSON.parse(response.content[0].text);",
+    "    if (JSON.stringify(summary).includes('private SIL viewer') || summary.users) throw new Error('Research gateway leaked viewer identities');",
+    "    result = { analysis: `The library currently contains ${summary.tv.seriesCount} TV shows, based on the live aggregate library summary.`, sources: [], completion: 'complete' };",
+    "  } else {",
+    "    const data = JSON.parse(prompt.split('Untrusted context and privacy-projected diagnostic facts:\\n')[1]);",
+    "    const count = data.facts.find(fact => fact.tool === 'media_public_library_summary').result.tv.seriesCount;",
+    "    if (!data.analysis.includes(`${count} TV shows`)) throw new Error('Chat model did not receive substantive research analysis');",
+    "    result = { message: `The managed library has ${count} TV shows.` };",
+    "  }",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 40, output_tokens: 10, total_tokens: 50 } })}\\n`);",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'slack-intent') {",
     "  const result = prompt.includes('How many shows are managed')",
     "    ? { intent: 'media_info', confidence: 0.99, mediaTitle: '', description: '', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, queryType: 'library_summary', service: '', socialTone: 'neutral', responseTopic: 'other', response: '' }",
     "    : prompt.includes('Is Plex online')",
@@ -917,7 +954,7 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
         thread_ts: "100.000",
         ts: "100.100",
         user: "U-SIL-REPORTER",
-        text: "<@B-SIL-BOT> The same failure also happens on a second player."
+        text: "The same failure also happens on a second player."
       }
     },
     event: {
@@ -926,15 +963,17 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
       thread_ts: "100.000",
       ts: "100.100",
       user: "U-SIL-REPORTER",
-      text: "<@B-SIL-BOT> The same failure also happens on a second player."
+      text: "The same failure also happens on a second player."
     }
   };
   const ignoredFollowup = structuredClone(followupEnvelope);
   ignoredFollowup.body.event_id = "EV-SIL-SLACK-FOLLOWUP-IGNORED";
   ignoredFollowup.body.event.ts = "100.050";
-  ignoredFollowup.body.event.text = "This unmentioned thread reply must not invoke the bot.";
+  ignoredFollowup.body.event.thread_ts = "99.000";
+  ignoredFollowup.body.event.text = "This unmentioned reply in an untracked thread must not invoke the bot.";
   ignoredFollowup.event.ts = "100.050";
-  ignoredFollowup.event.text = "This unmentioned thread reply must not invoke the bot.";
+  ignoredFollowup.event.thread_ts = "99.000";
+  ignoredFollowup.event.text = "This unmentioned reply in an untracked thread must not invoke the bot.";
   assert.deepEqual(await service.ingestEnvelope(ignoredFollowup), { accepted: false });
   assert.deepEqual(await service.ingestEnvelope(followupEnvelope), { accepted: true, duplicate: false });
   assert.equal(await service.processPendingForTest(), 1);
@@ -1057,14 +1096,18 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   const received = posts.find(post => post.kind === "issue_received");
   const status = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS");
   const threadedStatus = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS-THREAD");
-  const mediaInfoPost = posts.find(post => post.dedupeKey === "media-info:EV-SIL-SLACK-MEDIA-INFO");
+  const mediaInfoStarted = posts.find(post => post.dedupeKey === "media-check-started:EV-SIL-SLACK-MEDIA-INFO");
+  const mediaInfoPost = posts.find(post => post.dedupeKey === "media-check-result:EV-SIL-SLACK-MEDIA-INFO");
   const requestPost = posts.find(post => post.dedupeKey === "media-request:EV-SIL-SLACK-REQUEST");
   assert.equal(received.threadTs, "100.000");
   assert.equal(status.threadTs, null);
   assert.equal(threadedStatus.threadTs, "100.000");
   assert.equal(status.message, "<@U-SIL-REPORTER> Plex is online. 2 active streams.");
+  assert.equal(mediaInfoStarted.threadTs, "101.500");
+  assert.match(mediaInfoStarted.message, /checking the live details/);
   assert.equal(mediaInfoPost.threadTs, "101.500");
   assert.match(mediaInfoPost.message, /42 TV shows/);
+  assert.ok(posts.indexOf(mediaInfoStarted) < posts.indexOf(mediaInfoPost));
   assert.equal(requestPost.threadTs, "102.000");
   assert.match(requestPost.message, /submitted a Seerr request for SIL Request Movie/);
   assert.ok(fakeMcp.calls.some(call => call.name === "seerr_request_media"
@@ -1078,7 +1121,10 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   latest = await api(baseUrl, "/api/snapshot/latest");
   assert.ok(latest.snapshot.entries.some(entry => entry.source === "slack"));
   const tokensAfter = agent.status().tokenUsage.totalTokens;
-  assert.equal(tokensAfter - tokensBefore, 300);
+  const chatInvocations = (await codexInvocations(codexLogPath)).slice(before.length);
+  assert.equal(chatInvocations.filter(call => call.kind === "slack-diagnostics").length, 1);
+  assert.equal(chatInvocations.filter(call => call.kind === "slack-reply").length, 1);
+  assert.equal(tokensAfter - tokensBefore, 400);
 }
 
 async function run() {

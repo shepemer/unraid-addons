@@ -484,10 +484,14 @@ async function testRepairTelemetryFailureDoesNotFailExecution() {
 async function testRepairAbortCancelsInFlightMcpRequest() {
   const root = await tempDir();
   let upstreamServer;
+  const controller = new AbortController();
   try {
     let upstreamSeen = false;
     upstreamServer = http.createServer((_req, _res) => {
       upstreamSeen = true;
+      // Abort after the upstream request is actually in flight, independent of
+      // fixture process startup speed on a loaded test host.
+      setImmediate(() => controller.abort("fixture operator abort"));
     });
     await new Promise(resolve => upstreamServer.listen(0, "127.0.0.1", resolve));
     const upstreamUrl = `http://127.0.0.1:${upstreamServer.address().port}/mcp`;
@@ -506,8 +510,7 @@ async function testRepairAbortCancelsInFlightMcpRequest() {
       mcpRequestTimeoutMs: 60_000,
       codexRepairTimeoutMs: 60_000
     };
-    const controller = new AbortController();
-    const abortTimer = setTimeout(() => controller.abort("fixture operator abort"), 300);
+    const abortTimer = setTimeout(() => controller.abort("fixture operator abort"), 5000);
     const startedAt = Date.now();
     await assert.rejects(
       () => runCodexRepair(config, "fixture hanging MCP repair", {}, { abortSignal: controller.signal }),

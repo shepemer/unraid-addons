@@ -167,6 +167,7 @@ EXPECTED_TEMPLATE_TARGETS = {
         "ISSUE_AGENT_SLACK_APP_TOKEN",
         "ISSUE_AGENT_SLACK_BOT_TOKEN",
         "ISSUE_AGENT_SLACK_CHANNEL_ID",
+        "ISSUE_AGENT_SLACK_OWNER_USER_IDS",
         "ISSUE_AGENT_OPENAI_MODERATION_API_KEY",
     ),
     "utilities-mcp.xml": (
@@ -275,6 +276,7 @@ EXPECTED_COMPOSE_ENVIRONMENT_KEYS = {
         "ISSUE_AGENT_SLACK_APP_TOKEN",
         "ISSUE_AGENT_SLACK_BOT_TOKEN",
         "ISSUE_AGENT_SLACK_CHANNEL_ID",
+        "ISSUE_AGENT_SLACK_OWNER_USER_IDS",
         "ISSUE_AGENT_OPENAI_MODERATION_API_KEY",
     ),
     "utilities-mcp": (
@@ -435,8 +437,8 @@ for template_name, expected_targets in EXPECTED_TEMPLATE_TARGETS.items():
         EXPECTED_ALWAYS_TARGETS[template_name],
     )
 
-if sum(len(targets) for targets in EXPECTED_TEMPLATE_TARGETS.values()) != 66:
-    errors.append("validator template contract must contain exactly 66 Config targets")
+if sum(len(targets) for targets in EXPECTED_TEMPLATE_TARGETS.values()) != 67:
+    errors.append("validator template contract must contain exactly 67 Config targets")
 if sum(len(targets) for targets in EXPECTED_ALWAYS_TARGETS.values()) != 22:
     errors.append("validator template contract must contain exactly 22 routine targets")
 
@@ -606,7 +608,7 @@ expected_environment_keys = (
     "QBITTORRENT_URL", "QBITTORRENT_USERNAME", "QBITTORRENT_PASSWORD", "NZBGET_URL", "NZBGET_USERNAME",
     "NZBGET_PASSWORD", "SEERR_URL", "SEERR_API_KEY", "ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN", "ISSUE_AGENT_WEBUI_PORT",
     "ISSUE_AGENT_WEB_PASSWORD", "ISSUE_AGENT_PUSHOVER_APP_TOKEN", "ISSUE_AGENT_PUSHOVER_USER_KEY", "ISSUE_AGENT_SLACK_ENABLED",
-    "ISSUE_AGENT_SLACK_APP_TOKEN", "ISSUE_AGENT_SLACK_BOT_TOKEN", "ISSUE_AGENT_SLACK_CHANNEL_ID",
+    "ISSUE_AGENT_SLACK_APP_TOKEN", "ISSUE_AGENT_SLACK_BOT_TOKEN", "ISSUE_AGENT_SLACK_CHANNEL_ID", "ISSUE_AGENT_SLACK_OWNER_USER_IDS",
     "ISSUE_AGENT_OPENAI_MODERATION_API_KEY", "SCRUTINY_URL", "CODEX_CONFIG_DIR", "UNRAID_MCP_STATE_DIR",
     "UNRAID_MCP_LOG_DIR", "ISSUE_AGENT_CONFIG_DIR",
 )

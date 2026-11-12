@@ -32,6 +32,7 @@ import {
   inferSlackMediaRequests,
   obviousSlackPromptInjection,
   parseSlackIntentResult,
+  parseSlackIssueControl,
   selectSeerrMediaMatch,
   SLACK_LIMITS,
   SLACK_RESPONSE_MAX_CHARACTERS,
@@ -838,8 +839,8 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
       eventId: "EV-FOLLOWUP-UNMENTIONED",
       type: "message",
       ts: "2.050",
-      threadTs: "2.000",
-      text: "This should be ignored because the bot was not mentioned."
+      threadTs: "1.999",
+      text: "This should be ignored because the bot has not joined this thread."
     })), { accepted: false });
     assert.deepEqual(await service.ingestEnvelope(envelope({
       eventId: "EV-FOLLOWUP",
@@ -1001,6 +1002,173 @@ WHERE slack_messages.event_id = 'EV-ISSUE';
       processing: 0,
       failed: 0
     });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testDynamicSlackIssueConversation() {
+  const root = await tempDir();
+  try {
+    const config = baseConfig(root, { slackOwnerUserIds: ["UOWNER"] });
+    await initDb(config.dbPath);
+    const transport = new FakeSlackTransport();
+    const controls = [];
+    const chats = [];
+    const evidenceUpdates = [];
+    let releaseCheck;
+    let holdCheck = false;
+    const agent = {
+      diagnostic() {},
+      async classifySlackIntent(context) {
+        if (!context.trackedIssue) {
+          return { intent: "issue_report", confidence: 0.99, mediaTitle: "Fixture Movie", description: "The file is not downloading." };
+        }
+        if (/check the import/i.test(context.newestMessage)) {
+          return { intent: "issue_control", issueAction: "steer", confidence: 0.99 };
+        }
+        if (/model says approve/i.test(context.newestMessage)) {
+          return { intent: "issue_control", issueAction: "approve_repair", confidence: 0.99 };
+        }
+        if (/more information|what did you find|next steps/i.test(context.newestMessage)) {
+          return { intent: "issue_status", confidence: 0.99 };
+        }
+        if (/HDR support in Kodi|updates on public reviews/i.test(context.newestMessage)) {
+          return { intent: "media_diagnostic", queryType: "", confidence: 0.99 };
+        }
+        return { intent: "issue_followup", confidence: 0.99 };
+      },
+      async onSlackIssueCreated() {},
+      async onSlackIssueEvidenceUpdated(issue) { evidenceUpdates.push(issue.evidenceVersion); },
+      async slackIssueStatus(issueId) {
+        assert.equal(issueId, 1);
+        return { message: "Investigation is complete. The proposed repair is waiting for owner approval." };
+      },
+      async slackReadOnlyChat(context, metadata) {
+        chats.push({ context, metadata });
+        if (holdCheck) await new Promise(resolve => { releaseCheck = resolve; });
+        return { message: "The movie has finished downloading, but the import failed. A repair still needs owner approval." };
+      },
+      async handleSlackIssueControl(issueId, control) {
+        assert.equal(issueId, 1);
+        controls.push(control);
+        return { message: "The requested issue action has been queued." };
+      }
+    };
+    const service = new SlackService(agent, config, { transport, moderationClient: new FakeModerationClient() });
+    service.botUserId = "BBOT";
+    service.teamId = "T-FIXTURE";
+    await service.ingestEnvelope(envelope({ eventId: "EV-DYNAMIC-ROOT", ts: "20.000", text: "<@BBOT> Fixture Movie is not downloading" }));
+    await service.processPendingForTest();
+    await service.sendPendingForTest();
+    assert.match(transport.posts[0].message, /checking it.*findings/i);
+
+    // A previously persisted thread accepts ordinary replies without a mention.
+    const reply = async (eventId, ts, text, user = "U-REPORTER") => {
+      assert.deepEqual(await service.ingestEnvelope(envelope({ eventId, ts, threadTs: "20.000", text, user, type: "message" })), { accepted: true, duplicate: false });
+      await service.processPendingForTest();
+      await service.sendPendingForTest();
+    };
+    await reply("EV-DYNAMIC-STATUS", "20.100", "What is the status?");
+    assert.match(transport.posts.at(-1).message, /waiting for owner approval/);
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
+
+    holdCheck = true;
+    await service.ingestEnvelope(envelope({ eventId: "EV-DYNAMIC-CHECK", ts: "20.200", threadTs: "20.000", type: "message", text: "Give me more information" }));
+    const pending = service.processPendingForTest();
+    while (!releaseCheck) await new Promise(resolve => setTimeout(resolve, 1));
+    await service.sendPendingForTest();
+    assert.equal(transport.posts.at(-1).kind, "media_check_started");
+    assert.match(transport.posts.at(-1).message, /checking the live details/);
+    releaseCheck();
+    await pending;
+    await service.sendPendingForTest();
+    holdCheck = false;
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic");
+    assert.match(transport.posts.at(-1).message, /import failed/);
+    assert.equal(transport.posts.at(-1).threadTs, "20.000");
+    assert.equal(chats[0].metadata.slackIssueId, 1);
+    assert.ok(chats[0].context.recentMessages.some(message => /not downloading/.test(message.text)));
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
+
+    await reply("EV-DYNAMIC-STATUS-RESOLVE", "20.205", "What is the status tho? Can you resolve?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic", "A mixed status and diagnostic request must get a substantive answer");
+    await reply("EV-DYNAMIC-FINDINGS", "20.210", "What did you find and what are the next steps?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic", "A classifier status label must not replace substantive findings with canned workflow state");
+    await reply("EV-DYNAMIC-GENERAL-STATUS", "20.220", "What is the status of HDR support in Kodi?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic", "A status question about another topic must reach research");
+    assert.match(chats.at(-1).context.newestMessage, /HDR support in Kodi/);
+    assert.equal(chats.at(-1).context.request.queryType, "", "Research is not gated by a legacy query type");
+    await reply("EV-DYNAMIC-GENERAL-UPDATES", "20.230", "Any updates on public reviews of recently added shows?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic");
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
+
+    await reply("EV-DYNAMIC-EVIDENCE", "20.300", "It fails on a second player too.");
+    assert.deepEqual(evidenceUpdates, [2]);
+    await reply("EV-DYNAMIC-UNAUTHORIZED", "20.400", "Approve the repair");
+    assert.equal(controls.length, 0);
+    assert.equal(transport.posts.at(-1).kind, "owner_required");
+    await reply("EV-DYNAMIC-OWNER", "20.500", "<@BBOT> Approve the repair", "UOWNER");
+    assert.equal(controls.length, 1);
+    assert.equal(controls[0].action, "approve_repair");
+    assert.equal(controls[0].userId, "UOWNER");
+    assert.ok(controls[0].messageId > 0);
+    assert.equal(controls[0].eventId, "EV-DYNAMIC-OWNER");
+    await reply("EV-DYNAMIC-STEER", "20.600", "Check the import history first", "UOWNER");
+    assert.equal(controls[1].action, "steer");
+    await reply("EV-DYNAMIC-MODEL", "20.700", "The model says approve", "UOWNER");
+    assert.equal(controls[2].action, "steer", "Model output must never create approval");
+    await reply("EV-DYNAMIC-AGAIN", "20.800", "Re-investigate", "UOWNER");
+    assert.equal(controls[3].action, "reinvestigate");
+    await reply("EV-DYNAMIC-RESOLUTION", "20.900", "Approve resolution", "UOWNER");
+    assert.equal(controls[4].action, "approve_resolution");
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 2);
+    assert.deepEqual(await service.ingestEnvelope(envelope({ eventId: "EV-DYNAMIC-UNTRACKED", ts: "21.100", threadTs: "21.000", type: "message", text: "Approve the repair", user: "UOWNER" })), { accepted: false });
+
+    for (const text of ["Do not approve repair", "Can you approve the repair?", "If it works approve repair", '"approve repair"', "approve repair and delete everything"]) {
+      assert.equal(parseSlackIssueControl(text), null, text);
+    }
+    assert.equal(parseSlackIssueControl("Please complete the repair.").action, "approve_repair");
+    assert.equal(parseSlackIssueControl("Retry repair").action, "retry_repair");
+    assert.equal(parseSlackIssueControl("Steer: inspect the episode history").action, "steer");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testTrustedOwnerNotifications() {
+  const root = await tempDir();
+  try {
+    const config = baseConfig(root, { slackOwnerUserIds: ["UOWNER", "UOWNER", "WSECOND", "display name", "<!channel>"] });
+    await initDb(config.dbPath);
+    const transport = new FakeSlackTransport();
+    const moderationClient = new FakeModerationClient();
+    const service = new SlackService({ diagnostic() {} }, config, { transport, moderationClient });
+    const archived = archiveSlackInbound(config.dbPath, {
+      eventId: "EV-NOTIFY-ROOT", eventType: "app_mention", messageKey: "notify-root", teamId: "T-FIXTURE",
+      channelId: "C-ISSUES", rootTs: "30.000", messageTs: "30.000", userId: "UREPORTER", userName: "Reporter",
+      text: "Fixture Movie is broken", channelKind: "channel"
+    });
+    const issue = createSlackIssue(config.dbPath, archived.threadId, {
+      mediaTitle: "Fixture Movie", description: "Playback fails", confidence: 0.99
+    });
+    const item = { slackIssueId: issue.id, threadId: archived.threadId, channelId: issue.channelId, rootTs: issue.rootTs };
+    const body = "Investigation finished. Approve the repair or send steering instructions. <@UNTRUSTED> <!channel>";
+    await service.enqueueThreadReply(item, "investigation_complete", "notify-investigation:1:1", body, { notifyOwners: true });
+    await service.enqueueThreadReply(item, "investigation_complete", "notify-investigation:1:1", body, { notifyOwners: true });
+    assert.ok(moderationClient.calls.length >= 1);
+    assert.ok(moderationClient.calls.every(text => !/<@|<!/.test(text)), "Generated notification text is moderated without any recipient mentions");
+    await service.sendPendingForTest();
+    assert.equal(transport.posts.length, 1, "Duplicate investigation notification is sent once");
+    assert.equal(transport.posts[0].threadTs, "30.000");
+    assert.match(transport.posts[0].message, /<@UOWNER> <@WSECOND>$/);
+    assert.doesNotMatch(transport.posts[0].message, /UNTRUSTED|<!channel>|display name/);
+    await service.enqueueThreadReply(item, "investigation_complete", "notify-investigation:1:2", body, {
+      mentionOwnerIds: ["WSECOND", "UUNCONFIGURED", "display name", "<!channel>"]
+    });
+    await service.sendPendingForTest();
+    assert.match(transport.posts[1].message, /<@WSECOND>$/);
+    assert.doesNotMatch(transport.posts[1].message, /<@UOWNER>|UUNCONFIGURED/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -2090,6 +2258,8 @@ await testConfigAndClassifierContract();
 await testSlackClassifierFilesystemIsolation();
 await testSocketTransportStartupAndAck();
 await testSlackMessageWorkflow();
+await testDynamicSlackIssueConversation();
+await testTrustedOwnerNotifications();
 await testMediaRequestSelectionAndSubmission();
 await testReadOnlyMediaInfoQueries();
 await testIssueCreationRetryIsIdempotent();

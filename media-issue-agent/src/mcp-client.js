@@ -36,7 +36,7 @@ export class MediaMcpClient {
     this.id = 1;
   }
 
-  async request(method, params = {}, label = method) {
+  async request(method, params = {}, label = method, options = {}) {
     const body = {
       jsonrpc: "2.0",
       id: this.id++,
@@ -45,7 +45,7 @@ export class MediaMcpClient {
     };
     const response = await fetch(this.url, {
       method: "POST",
-      signal: AbortSignal.timeout(this.timeoutMs),
+      signal: AbortSignal.any([AbortSignal.timeout(this.timeoutMs || 30000), ...(options.signal ? [options.signal] : [])]),
       headers: {
         authorization: `Bearer ${this.token}`,
         "content-type": "application/json",
@@ -68,17 +68,17 @@ export class MediaMcpClient {
     return parsed?.result;
   }
 
-  async callTool(name, args = {}) {
+  async callTool(name, args = {}, options = {}) {
     const result = await this.request("tools/call", {
       name,
       arguments: args
-    }, name);
+    }, name, options);
     const toolText = result?.content?.[0]?.text;
     return toolText ? JSON.parse(toolText) : result;
   }
 
-  async listTools() {
-    const result = await this.request("tools/list", {}, "tools/list");
+  async listTools(options = {}) {
+    const result = await this.request("tools/list", {}, "tools/list", options);
     return Array.isArray(result?.tools) ? result.tools : [];
   }
 }

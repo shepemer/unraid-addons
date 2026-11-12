@@ -26,6 +26,7 @@ import {
   slackMessagesForThread,
   slackModerationStatus,
   slackQueueStatus,
+  slackThreadForMessage,
   updateSlackReporterIdentity
 } from "./db.js";
 import {
@@ -60,6 +61,9 @@ const CLASSIFIER_INTENTS = new Set([
   "conversation",
   "issue_report",
   "issue_followup",
+  "issue_status",
+  "issue_control",
+  "media_diagnostic",
   "media_info",
   "media_request",
   "plex_status",
@@ -166,6 +170,42 @@ function stripSlackMentions(value) {
     .replace(/<![^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+export function parseSlackIssueControl(value) {
+  const message = stripSlackMentions(value).trim();
+  const text = message.toLowerCase().replace(/^please\s+/, "").replace(/[.!]+$/, "").trim();
+  if (/^(?:i\s+)?(?:approve|authorize)(?:\s+the)?\s+(?:repair|fix)(?:\s+plan)?$/.test(text)
+    || /^(?:complete|do|run|execute|start)(?:\s+the)?\s+(?:repair|fix)$/.test(text)) {
+    return { action: "approve_repair", message };
+  }
+  if (/^(?:approve|post)(?:\s+the)?\s+resolution(?:\s+and\s+close(?:\s+the)?\s+(?:issue|ticket))?$/.test(text)
+    || /^close(?:\s+the)?\s+(?:issue|ticket)$/.test(text)) {
+    return { action: "approve_resolution", message };
+  }
+  if (/^retry(?:\s+the)?\s+repair$/.test(text)) {
+    return { action: "retry_repair", message };
+  }
+  if (/^(?:re[ -]?investigate|investigate again|check again|take another look)(?:$|[,:.]|\s+(?:please|and|with|using|the|this|it|because)\b)/.test(text)) {
+    return { action: "reinvestigate", message };
+  }
+  if (/^(?:steer|investigation instructions?|repair instructions?)\s*[:,-]\s*\S/.test(text)) {
+    return { action: "steer", message };
+  }
+  return null;
+}
+
+function isSlackIssueStatusQuestion(value) {
+  const text = stripSlackMentions(value).toLowerCase().replace(/[.!?]+$/, "").trim();
+  // Only short workflow questions bypass classification. A leading "status"
+  // must not swallow a research question about another subject in this thread.
+  return /^(?:what(?:'s| is)(?: the)? status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|(?:any|an) updates?(?: (?:on|about|for) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|how(?:'s| is) (?:it|(?:the |this |my |our )?(?:repair|investigation)) going)$/.test(text);
+}
+
+function asksForIssueExplanation(value) {
+  const text = stripSlackMentions(value).toLowerCase();
+  return /\b(?:more (?:info(?:rmation)?|details)|what does (?:that|this) mean|what (?:did you find|have you found)|findings|next (?:diagnostic |repair )?steps|is it downloaded|can you (?:resolve|fix|check|investigate)|try harder|why|what(?:'s| is) (?:happening|going on))\b/.test(text)
+    || /^(?:ok(?:ay)?[, ]+)?(?:do that|check that|look into it)[.!?]*$/.test(text);
 }
 
 export function obviousSlackPromptInjection(value) {
@@ -316,6 +356,8 @@ export function parseSlackIntentResult(output) {
   const result = {
     intent,
     confidence,
+    ...(parsed.researchComplexity === "excessive" ? { researchComplexity: "excessive" } : {}),
+    ...(intent === "issue_control" ? { issueAction: ["steer", "reinvestigate"].includes(parsed.issueAction) ? parsed.issueAction : "steer" } : {}),
     mediaTitle: compact(redactText(stripSlackMentions(parsed.mediaTitle)), 160),
     description: compact(redactText(stripSlackMentions(parsed.description)), 1200),
     clarification: compact(redactText(stripSlackMentions(parsed.clarification)), 120),
@@ -989,7 +1031,7 @@ export class SlackService {
       return null;
     }
     const teamId = String(body.team_id || body.authorizations?.[0]?.team_id || this.teamId || "");
-    if (!teamId) {
+    if (!teamId || (this.teamId && teamId !== this.teamId)) {
       return null;
     }
     if (event.user_team && String(event.user_team) !== teamId) {
@@ -999,7 +1041,14 @@ export class SlackService {
     const mentioned = Boolean(this.botUserId && String(event.text).includes(`<@${this.botUserId}>`));
     const appMention = event.type === "app_mention";
     if (!dm && !appMention && !mentioned) {
-      return null;
+      // Existing issue and conversation threads remain addressable after an
+      // upgrade. Only follow replies to roots already tracked by this bot.
+      const tracked = event.thread_ts && slackThreadForMessage(
+        this.dbPath, teamId, String(event.channel), rootTs
+      );
+      if (!tracked) {
+        return null;
+      }
     }
     const messageTs = String(event.ts);
     const messageKey = messageIdentity(teamId, String(event.channel), messageTs);
@@ -1307,7 +1356,8 @@ export class SlackService {
   }
 
   async enqueueThreadReply(item, kind, dedupeKey, message, options = {}) {
-    let safeMessage = compact(message, 3500);
+    const notifyOwners = options.notifyOwners === true || Array.isArray(options.mentionOwnerIds);
+    let safeMessage = compact(notifyOwners ? stripSlackMentions(message) : message, 3500);
     if (!options.trustedTemplate) {
       const contentDigest = keyedSlackContentDigest(safeMessage, this.pendingEncryptionKey);
       const localCategory = highConfidenceSlackSafetyCategory(safeMessage);
@@ -1348,6 +1398,16 @@ export class SlackService {
           });
           safeMessage = moderationErrorSlackResponse();
         }
+      }
+    }
+    if (notifyOwners) {
+      // Notification recipients are application configuration, never generated
+      // text. Append them only after the public body has passed moderation.
+      const requested = options.notifyOwners === true ? null : options.mentionOwnerIds;
+      const recipients = this.ownerUserIds().filter(id => !requested || requested.includes(id));
+      const mentions = recipients.map(id => `<@${id}>`).join(" ");
+      if (mentions) {
+        safeMessage = `${compact(safeMessage, 3500 - mentions.length - 1)} ${mentions}`;
       }
     }
     return enqueueSlackOutbox(this.dbPath, {
@@ -1398,22 +1458,33 @@ export class SlackService {
     if (!await this.ensureInboundModerated(item)) {
       return;
     }
+    const control = item.slackIssueId ? parseSlackIssueControl(item.text) : null;
+    if (control) {
+      await this.handleIssueControl(item, control);
+      return;
+    }
+    if (item.slackIssueId && isSlackIssueStatusQuestion(item.text)) {
+      await this.replyWithIssueStatus(item);
+      return;
+    }
     await this.resolveUserName(item);
     const recentMessages = slackMessagesForThread(this.dbPath, item.threadId, 11)
-      .filter(message => Number(message.id) !== Number(item.messageId))
+      .filter(message => Number(message.id) !== Number(item.messageId)
+        && (message.direction !== "inbound" || Number(message.messageTs) < Number(item.messageTs)))
       .slice(-10)
       .map(message => ({
         direction: message.direction,
         user: message.direction === "inbound" ? "human" : "bot",
         text: compact(stripSlackMentions(message.text), 4000)
       }));
-    let result = await this.agent.classifySlackIntent({
+    const context = {
       trackedIssue: Boolean(item.slackIssueId),
       threadKind: item.threadKind,
       channelKind: item.channelId === this.config.slackChannelId ? "channel" : "dm",
       recentMessages,
       newestMessage: compact(stripSlackMentions(item.text), 4000)
-    }, {
+    };
+    let result = await this.agent.classifySlackIntent(context, {
       eventId: item.eventId,
       threadId: item.threadId,
       slackIssueId: item.slackIssueId || null
@@ -1443,10 +1514,66 @@ export class SlackService {
         mediaRequests: inferredRequests
       };
     }
-    await this.applyIntent(item, result);
+    await this.applyIntent(item, result, context);
   }
 
-  async applyIntent(item, result) {
+  async replyWithIssueStatus(item) {
+    const answer = await this.agent.slackIssueStatus(item.slackIssueId, {
+      eventId: item.eventId, threadId: item.threadId
+    });
+    await this.enqueueThreadReply(item, answer.kind || "issue_status", `issue-status:${item.eventId}`, answer.message);
+  }
+
+  ownerUserIds() {
+    const configured = this.config.slackOwnerUserIds;
+    const owners = Array.isArray(configured) ? configured : String(configured || "").split(",");
+    return [...new Set(owners.map(value => String(value).trim()).filter(value => /^[UW][A-Z0-9]{2,}$/.test(value)))];
+  }
+
+  isOwner(userId) {
+    return this.ownerUserIds().includes(String(userId));
+  }
+
+  async handleIssueControl(item, control) {
+    if (!this.isOwner(item.userId)) {
+      await this.enqueueThreadReply(item, "owner_required", `owner-required:${item.eventId}`,
+        "The server owner can approve repairs or steer the investigation here. I can still check the issue and explain the findings.",
+        { trustedTemplate: true });
+      return;
+    }
+    // Send durable progress before starting work; the outbound worker runs
+    // independently while Codex or the existing approval workflow is active.
+    await this.enqueueThreadReply(item, "issue_control_started", `issue-control-started:${item.eventId}`,
+      "I’m checking the current issue state and your instructions. I’ll post the result here.", { trustedTemplate: true });
+    const answer = await this.agent.handleSlackIssueControl(item.slackIssueId, {
+      ...control,
+      userId: item.userId,
+      eventId: item.eventId,
+      threadId: item.threadId,
+      messageId: item.messageId
+    });
+    if (answer?.message) {
+      await this.enqueueThreadReply(item, answer.kind || "issue_control", `issue-control:${item.eventId}`, answer.message);
+    }
+  }
+
+  async replyWithReadOnlyChat(item, result, context) {
+    await this.enqueueThreadReply(item, "media_check_started", `media-check-started:${item.eventId}`,
+      "I’m checking the live details. I’ll reply here with what I find.", { trustedTemplate: true });
+    const answer = await this.agent.slackReadOnlyChat({
+      ...context,
+      trackedIssue: Boolean(item.slackIssueId),
+      newestMessage: context.newestMessage || compact(stripSlackMentions(item.text), 4000),
+      request: result
+    }, {
+      eventId: item.eventId,
+      threadId: item.threadId,
+      slackIssueId: item.slackIssueId || null
+    });
+    await this.enqueueThreadReply(item, answer.kind || "media_diagnostic", `media-check-result:${item.eventId}`, answer.message);
+  }
+
+  async applyIntent(item, result, context = {}) {
     if (result.socialTone === "exploit_attempt") {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "conversation", "closed");
@@ -1457,6 +1584,32 @@ export class SlackService {
         `exploit-attempt:${item.eventId}`,
         exploitAttemptResponse(item.eventId)
       );
+      return;
+    }
+
+    if (item.slackIssueId && result.intent === "issue_status") {
+      if (asksForIssueExplanation(item.text)) {
+        await this.replyWithReadOnlyChat(item, result, context);
+      } else {
+        await this.replyWithIssueStatus(item);
+      }
+      return;
+    }
+
+    if (item.slackIssueId && result.intent === "issue_control") {
+      // Model routing can ask for more read-only work. It can never create an
+      // approval: repair/resolution approval requires the explicit parser.
+      await this.handleIssueControl(item, {
+        action: result.issueAction === "reinvestigate" ? "reinvestigate" : "steer",
+        message: stripSlackMentions(item.text)
+      });
+      return;
+    }
+
+    if (result.intent === "media_diagnostic"
+      || (item.slackIssueId && result.intent === "issue_followup"
+        && asksForIssueExplanation(item.text))) {
+      await this.replyWithReadOnlyChat(item, result, context);
       return;
     }
 
@@ -1485,6 +1638,10 @@ export class SlackService {
     if (result.intent === "media_info") {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "media_info", "closed");
+      }
+      if (typeof this.agent.slackReadOnlyChat === "function") {
+        await this.replyWithReadOnlyChat(item, result, context);
+        return;
       }
       const answer = await this.agent.slackMediaInfo(result, {
         eventId: item.eventId,
@@ -1557,7 +1714,7 @@ export class SlackService {
         "issue_received",
         `issue-received:${issue.id}`,
         personalityResponse(
-          `I filed Slack issue #${issue.id} for ${issue.mediaTitle}.`,
+          `I filed Slack issue #${issue.id} for ${issue.mediaTitle}. I’m checking it and will post the findings and next steps here.`,
           result.socialTone
         )
       );
@@ -1574,7 +1731,7 @@ export class SlackService {
         "issue_followup",
         `issue-followup:${item.eventId}`,
         personalityResponse(
-          `I added this information to Slack issue #${issue.id}. It will be included before the next repair approval.`,
+          `I added this information to Slack issue #${issue.id}. I’ll check it and post updated findings here before any repair approval.`,
           result.socialTone
         )
       );
