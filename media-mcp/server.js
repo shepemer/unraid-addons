@@ -6,6 +6,10 @@ import { constants as fsConstants } from "node:fs";
 import { access, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import nodePath from "node:path";
 import * as z from "zod/v4";
+import { createDownloadRepairCapabilities, exactTorrentFromAddResult, registerDownloadRepairTools, terminalCommand } from "./download-repair.js";
+import { plexScanStatus, registerPlexDiagnosticsTools, runPlexSectionScan } from "./plex-diagnostics.js";
+import { registerMediaFilesystemTools, mediaFileInputOptions } from "./media-filesystem.js";
+import { createPublicWatchtimeSummary } from "./public-watchtime.js";
 
 const env = process.env;
 const port = Number(env.MEDIA_MCP_PORT || 6971);
@@ -57,6 +61,7 @@ const arrWantedMaxLimit = 5000;
 const arrWantedInternalPageSize = 250;
 const arrExactSearchDefaultBatchSize = 100;
 const arrExactSearchMaxBatchSize = 250;
+const downloadRepairCapabilities = createDownloadRepairCapabilities({ arrApi, qbitRequest, requireService, arrQueueDetails, bazarrApi, normalizeSubtitleLanguage });
 
 const arrWantedPaginationSchema = {
   page: z.number().int().min(1).optional(),
@@ -237,6 +242,19 @@ function limitPlexContainer(value, limit) {
   if (!container) {
     return value;
   }
+  if (Array.isArray(container.Hub)) {
+    let remaining = max;
+    const totalRecords = container.Hub.reduce((sum, hub) => sum + (Array.isArray(hub.Metadata) ? hub.Metadata.length : 0), 0);
+    const hubs = container.Hub.flatMap(hub => {
+      const items = (Array.isArray(hub.Metadata) ? hub.Metadata : []).slice(0, remaining);
+      remaining -= items.length;
+      if (!items.length) return [];
+      return [compactObject({ type: hub.type, title: hub.title, size: items.length,
+        Metadata: items.map(item => { const { parts, ...metadata } = summarizePlexMetadataItem(item); return metadata; }) })];
+    });
+    return { MediaContainer: { size: hubs.length, totalRecords, returnedRecords: max - remaining,
+      truncated: totalRecords > max - remaining || container.Hub.some(hub => Number(hub.size) > (hub.Metadata || []).length), Hub: hubs } };
+  }
   for (const key of ["Metadata", "Directory", "Hub"]) {
     if (Array.isArray(container[key])) {
       return {
@@ -303,7 +321,7 @@ async function plexApi(path = "", options = {}) {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(options.body);
   }
-  return fetchJson(url, { method: options.method || "GET", headers, body });
+  return fetchJson(url, { method: options.method || "GET", headers, body, timeoutMs: options.timeoutMs, signal: options.signal });
 }
 
 async function plexCommunityGraphql(query, variables = {}, operationName) {
@@ -350,7 +368,7 @@ async function bazarrApi(path, options = {}) {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(options.body);
   }
-  return fetchJson(url, { method: options.method || "GET", headers, body });
+  return fetchJson(url, { method: options.method || "GET", headers, body, timeoutMs: options.timeoutMs, signal: options.signal });
 }
 
 async function arrApi(serviceName, apiVersion, path, options = {}) {
@@ -370,7 +388,7 @@ async function arrApi(serviceName, apiVersion, path, options = {}) {
     headers["Content-Type"] = "application/json";
     body = JSON.stringify(options.body);
   }
-  return fetchJson(url, { method: options.method || "GET", headers, body });
+  return fetchJson(url, { method: options.method || "GET", headers, body, timeoutMs: options.timeoutMs, signal: options.signal });
 }
 
 async function seerrApi(path, options = {}) {
@@ -404,7 +422,7 @@ async function tautulliApi(cmd, options = {}) {
       url.searchParams.set(key, String(value));
     }
   }
-  const body = await fetchJson(url, { method: "GET", headers: { Accept: "application/json" } });
+  const body = await fetchJson(url, { method: "GET", headers: { Accept: "application/json" }, timeoutMs: options.timeoutMs, signal: options.signal });
   if (body?.response?.result === "error") {
     throw new Error(`Tautulli ${cmd} failed: ${body.response.message || "unknown error"}`);
   }
@@ -615,6 +633,7 @@ async function threadfinWs(cmd, payload = {}, options = {}) {
 
 async function qbitRequest(path, options = {}) {
   const service = requireService("qbittorrent");
+  const signal = options.signal || AbortSignal.timeout(options.timeoutMs || requestTimeoutMs);
   const loginBody = new URLSearchParams({
     username: service.username,
     password: service.password
@@ -622,7 +641,7 @@ async function qbitRequest(path, options = {}) {
   const loginResponse = await fetch(`${service.url}/api/v2/auth/login`, {
     method: "POST",
     body: loginBody,
-    signal: AbortSignal.timeout(requestTimeoutMs)
+    signal
   });
   const loginText = await loginResponse.text();
   const loginOk = loginResponse.ok && (loginResponse.status === 204 || loginText.includes("Ok."));
@@ -635,15 +654,15 @@ async function qbitRequest(path, options = {}) {
   }
 
   const headers = { Cookie: cookie, Accept: "application/json" };
-  let body;
-  if (options.form) {
+  let body = options.formData;
+  if (!body && options.form) {
     body = new URLSearchParams(options.form);
   }
   const response = await fetch(`${service.url}/api/v2/${path.replace(/^\/+/, "")}`, {
     method: options.method || "GET",
     headers,
     body,
-    signal: AbortSignal.timeout(requestTimeoutMs)
+    signal
   });
   const text = await response.text();
   if (!response.ok) {
@@ -918,7 +937,7 @@ function mediaReadPathCandidates(pathValue) {
     return candidates;
   }
   const parts = clean.split("/").filter(Boolean);
-  const libraryMarkers = new Set(["tv", "shows", "series", "movies", "movie", "films", "anime"]);
+  const libraryMarkers = new Set(["tv", "tv shows", "tv series", "television", "shows", "series", "movies", "movie", "films", "anime"]);
   const roots = mediaDeleteRootSummary();
   for (const root of roots) {
     const cleanRoot = cleanPath(root);
@@ -1933,7 +1952,7 @@ function plexMetadataOperationEndpoint(input) {
     return {
       operation,
       sectionKey,
-      method: "PUT",
+      method: "POST",
       path: `library/sections/${encodeURIComponent(sectionKey)}/refresh`,
       displayPath: `/library/sections/${sectionKey}/refresh`,
       query: compactObject({ path: input.path })
@@ -1972,6 +1991,8 @@ async function plexDeleteMetadata(input) {
       note: "Set dryRun to false to run this exact Plex metadata or section operation."
     };
   }
+  const scanRequest = endpoint.operation === "scan_section"
+    ? await runPlexSectionScan(plexApi, endpoint.sectionKey, input.path) : null;
   return {
     dryRun: false,
     operation: endpoint.operation,
@@ -1983,7 +2004,10 @@ async function plexDeleteMetadata(input) {
       path: endpoint.displayPath,
       query: endpoint.query
     },
-    result: await plexApi(endpoint.path, { method: endpoint.method, query: endpoint.query })
+    result: scanRequest
+      ? scanRequest.result
+      : await plexApi(endpoint.path, { method: endpoint.method, query: endpoint.query }),
+    ...(scanRequest ? { scanRequest: { accepted: scanRequest.accepted, method: scanRequest.method }, scanStatus: await plexScanStatus(plexApi, { sectionKey: endpoint.sectionKey }) } : {})
   };
 }
 
@@ -2028,7 +2052,7 @@ async function plexScanLibraryPath(input) {
     for (const scanPath of paths) {
       actions.push({
         type: "scan_path",
-        method: "PUT",
+        method: "POST",
         path: `/library/sections/${sectionKey}/refresh`,
         query: { path: scanPath }
       });
@@ -2092,7 +2116,9 @@ async function plexScanLibraryPath(input) {
       results.push({
         action: action.type,
         ok: true,
-        result: await plexApi(apiPath, { method: action.method, query: action.query })
+        result: action.type === "scan_path"
+          ? await runPlexSectionScan(plexApi, sectionKey, action.query.path)
+          : await plexApi(apiPath, { method: action.method, query: action.query })
       });
     } catch (error) {
       results.push({ action: action.type, ok: false, error: redactText(error.message) });
@@ -2102,7 +2128,11 @@ async function plexScanLibraryPath(input) {
     ...base,
     dryRun: false,
     results,
-    ok: results.every(result => result.ok)
+    ok: results.every(result => result.ok),
+    ...(actions.some(action => action.type === "scan_path") ? {
+      scanStatus: await plexScanStatus(plexApi, { sectionKey }),
+      completionVerified: false
+    } : {})
   };
 }
 
@@ -2615,11 +2645,34 @@ function sonarrQueueMatchesScope(record, scope) {
   return recordEpisodeIds.some(id => wantedEpisodeIds.includes(id));
 }
 
-async function suppressNewSonarrQueueItems(beforeIds, scope, settleMs) {
+async function suppressNewSonarrQueueItems(beforeIds, scope, settleMs, commandsBefore) {
   const deadline = Date.now() + settleMs;
+  const hardDeadline = Date.now() + Math.min(60000, Math.max(10000, settleMs));
+  const signal = AbortSignal.timeout(Math.max(1, hardDeadline - Date.now()));
+  let requestCount = 0;
+  const requestOptions = () => {
+    if (signal.aborted || Date.now() >= hardDeadline || requestCount >= 100) throw new Error("Sonarr suppression observation budget exhausted");
+    requestCount++;
+    return { signal, timeoutMs: Math.max(1, hardDeadline - Date.now()) };
+  };
+  let observationIncomplete = false;
+  let records = [];
   const matched = new Map();
   const cleanupRuns = [];
   const attemptedIds = new Set();
+  const searchCommands = new Map();
+  let commandsReadable = commandsBefore !== null;
+  async function observeSearchCommands() {
+    try {
+      const commands = await arrApi("sonarr", "v3", "command", requestOptions());
+      for (const command of Array.isArray(commands) ? commands : []) {
+        const body = command.body || command;
+        const scoped = Number(body.seriesId) === Number(scope.seriesId)
+          || (body.episodeIds || []).some(id => scope.episodeIds.includes(Number(id)));
+        if (commandsBefore && !commandsBefore.has(Number(command.id)) && scoped && /search/i.test(command.name || body.name || "")) searchCommands.set(Number(command.id), command);
+      }
+    } catch { commandsReadable = false; }
+  }
   async function cleanMatches(records) {
     const newMatches = records.filter(record => {
       const recordId = Number(record.id);
@@ -2627,7 +2680,7 @@ async function suppressNewSonarrQueueItems(beforeIds, scope, settleMs) {
         && !beforeIds.has(recordId)
         && !attemptedIds.has(recordId)
         && sonarrQueueMatchesScope(record, scope);
-    });
+    }).slice(0, 50);
     if (!newMatches.length) {
       return;
     }
@@ -2640,30 +2693,43 @@ async function suppressNewSonarrQueueItems(beforeIds, scope, settleMs) {
       removeFromClient: true,
       blocklist: true,
       skipRedownload: true,
-      dryRun: false
+      dryRun: false,
+      requestOptions
     }));
   }
-  do {
-    const records = await arrQueueDetails("sonarr");
-    await cleanMatches(records);
-    if (Date.now() >= deadline) {
-      break;
-    }
-    await delay(Math.min(250, Math.max(1, deadline - Date.now())));
-  } while (Date.now() <= deadline);
-  await cleanMatches(await arrQueueDetails("sonarr"));
-  const records = await arrQueueDetails("sonarr");
-  const remaining = records.filter(record => matched.has(Number(record.id)));
+  try {
+    do {
+      records = await arrQueueDetails("sonarr", requestOptions());
+      await cleanMatches(records);
+      await observeSearchCommands();
+      if (Date.now() >= deadline) {
+        break;
+      }
+      await delay(Math.min(250, Math.max(1, deadline - Date.now())));
+    } while (Date.now() <= deadline);
+    await cleanMatches(await arrQueueDetails("sonarr", requestOptions()));
+    await observeSearchCommands();
+    records = await arrQueueDetails("sonarr", requestOptions());
+  } catch {
+    observationIncomplete = true;
+    commandsReadable = false;
+  }
+  const remaining = records.filter(record => !beforeIds.has(Number(record.id)) && sonarrQueueMatchesScope(record, scope));
   return {
     records,
     matches: [...matched.values()],
     cleanupRuns,
-    remaining
+    remaining,
+    searchCommands: [...searchCommands.values()].map(command => ({ id: command.id, name: command.name || command.body?.name, status: command.status || command.state })),
+    searchesFinished: commandsReadable && searchCommands.size > 0 && [...searchCommands.values()].every(terminalCommand),
+    commandsReadable,
+    observationIncomplete
   };
 }
 
 async function sonarrBlocklistHistoryWithoutRetry(input) {
   const queueBefore = await arrQueueDetails("sonarr");
+  const commandsBefore = await arrApi("sonarr", "v3", "command").then(commands => new Set((Array.isArray(commands) ? commands : []).map(command => Number(command.id)))).catch(() => null);
   const beforeIds = new Set(queueBefore.map(record => Number(record.id)).filter(Number.isInteger));
   const blocklist = await sonarrBlocklistEpisodeFileSource(input);
   const base = {
@@ -2690,7 +2756,7 @@ async function sonarrBlocklistHistoryWithoutRetry(input) {
     seriesId: blocklist.blocklistEntry?.seriesId,
     episodeIds: blocklist.episodeIds
   };
-  const observed = await suppressNewSonarrQueueItems(beforeIds, scope, input.settleMs);
+  const observed = await suppressNewSonarrQueueItems(beforeIds, scope, input.settleMs, commandsBefore);
   const replacementIds = observed.matches.map(record => record.id);
   const deleteResults = observed.cleanupRuns.flatMap(run => run.deleteResults || []);
   const failedCleanup = deleteResults.filter(result => !result.ok);
@@ -2709,11 +2775,16 @@ async function sonarrBlocklistHistoryWithoutRetry(input) {
     queueObservedAfterBlocklist: observed.records.map(summarizeQueueRecord),
     replacementQueueItems: observed.matches.map(summarizeQueueRecord),
     replacementCleanup,
-    replacementSuppressed: failedCleanup.length === 0 && observed.remaining.length === 0,
+    replacementSuppressed: failedCleanup.length === 0 && observed.remaining.length === 0 && observed.searchesFinished,
     verification: {
-      status: failedCleanup.length === 0 && observed.remaining.length === 0 ? "passed" : "failed",
+      status: failedCleanup.length || observed.remaining.length ? "failed" : observed.searchesFinished ? "passed" : "incomplete",
       observedReplacementCount: replacementIds.length,
-      remainingReplacementCount: observed.remaining.length
+      remainingReplacementCount: observed.remaining.length,
+      searchCommands: observed.searchCommands,
+      searchesFinished: observed.searchesFinished,
+      commandsReadable: observed.commandsReadable,
+      observationIncomplete: observed.observationIncomplete,
+      note: observed.searchesFinished ? "Resulting scoped searches finished before suppression was verified." : "Suppression is not verified until resulting searches finish; an empty queue alone does not establish success."
     }
   };
 }
@@ -3052,10 +3123,34 @@ async function sonarrBlocklistReleaseCandidates(input) {
 
 function plexMetadataRecords(body) {
   const container = body?.MediaContainer || {};
+  const seen = new Set();
   return [
-    ...(container.Metadata || []),
-    ...(container.Directory || [])
-  ];
+    ...(Array.isArray(container.Metadata) ? container.Metadata : []),
+    ...(Array.isArray(container.Directory) ? container.Directory : [])
+  ].filter(record => {
+    const key = record?.ratingKey || record?.key;
+    if (key && seen.has(String(key))) return false;
+    if (key) seen.add(String(key));
+    return record && typeof record === "object";
+  });
+}
+
+async function plexMetadataPage(path, { limit = 100, offset = 0, signal, timeoutMs } = {}) {
+  const body = await plexApi(path, { query: { "X-Plex-Container-Start": offset, "X-Plex-Container-Size": limit }, signal, timeoutMs });
+  if (!body?.MediaContainer || typeof body.MediaContainer !== "object" || Array.isArray(body.MediaContainer)) throw new Error("Plex metadata endpoint did not return a MediaContainer object");
+  // Some child responses also include navigation Directory entries such as
+  // 'All episodes'. Those are not media records and must not alter item counts.
+  const all = plexMetadataRecords(body).filter(record => record.ratingKey !== undefined || ["movie", "show", "season", "episode", "artist", "album", "track"].includes(record.type));
+  const records = all.slice(0, limit);
+  const rawTotal = body.MediaContainer.totalSize;
+  const upstreamTotal = typeof rawTotal === "number" || (typeof rawTotal === "string" && /^\d+$/.test(rawTotal)) ? Number(rawTotal) : NaN;
+  const totalSize = Number.isSafeInteger(upstreamTotal) && upstreamTotal >= 0 ? upstreamTotal : null;
+  const hasMore = totalSize === null ? all.length >= limit : offset + records.length < totalSize;
+  return {
+    records,
+    pagination: { offset, total: totalSize ?? all.length, totalSize, returned: records.length,
+      complete: !hasMore, truncated: hasMore, nextOffset: hasMore && records.length ? offset + records.length : null }
+  };
 }
 
 function summarizePlexPart(part) {
@@ -3108,6 +3203,8 @@ function summarizePlexMetadataItem(item) {
     parentIndex: item?.parentIndex,
     year: item?.year,
     originallyAvailableAt: item?.originallyAvailableAt,
+    addedAt: item?.addedAt,
+    updatedAt: item?.updatedAt,
     duration: item?.duration,
     guid: item?.guid,
     parts
@@ -3119,14 +3216,11 @@ async function plexListSeasonChildren(input) {
   if (!ratingKey) {
     throw new Error("ratingKey is required");
   }
-  const body = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}/children`);
-  const records = plexMetadataRecords(body);
-  const limited = records.slice(0, input.limit);
+  const { records, pagination } = await plexMetadataPage(`library/metadata/${encodeURIComponent(ratingKey)}/children`, input);
   return {
     ratingKey,
-    total: records.length,
-    returned: limited.length,
-    children: limited.map(summarizePlexMetadataItem)
+    ...pagination,
+    children: records.map(summarizePlexMetadataItem)
   };
 }
 
@@ -3147,7 +3241,9 @@ function summarizePlexSeasonItem(item) {
     leafCount: item?.leafCount,
     viewedLeafCount: item?.viewedLeafCount,
     duration: item?.duration,
-    originallyAvailableAt: item?.originallyAvailableAt
+    originallyAvailableAt: item?.originallyAvailableAt,
+    addedAt: item?.addedAt,
+    updatedAt: item?.updatedAt
   });
 }
 
@@ -3156,14 +3252,12 @@ async function plexListShowSeasons(input) {
   if (!ratingKey) {
     throw new Error("ratingKey is required");
   }
-  const body = await plexApi(`library/metadata/${encodeURIComponent(ratingKey)}/children`);
-  const records = plexMetadataRecords(body);
+  const { records, pagination } = await plexMetadataPage(`library/metadata/${encodeURIComponent(ratingKey)}/children`, input);
   const seasons = records
-    .filter(record => !record.type || record.type === "season" || record.leafCount !== undefined || record.childCount !== undefined)
-    .slice(0, input.limit);
+    .filter(record => record.type === "season" || (!record.type && record.index !== undefined && (record.leafCount !== undefined || record.childCount !== undefined)));
   return {
     ratingKey,
-    total: records.length,
+    ...pagination,
     returned: seasons.length,
     seasons: seasons.map(summarizePlexSeasonItem)
   };
@@ -3345,6 +3439,7 @@ function hammingHex(left, right) {
 async function frameAverageHash(ffmpeg, pathValue, timestampSeconds) {
   const result = await runCommandBufferResult(ffmpeg, [
     "-v", "error",
+    ...mediaFileInputOptions,
     "-ss", String(timestampSeconds),
     "-i", pathValue,
     "-frames:v", "1",
@@ -3401,6 +3496,7 @@ async function mediaProbeVideoContent(input) {
   }
   const probeResult = await runCommandResult(ffprobe, [
     "-v", "error",
+    ...mediaFileInputOptions,
     "-print_format", "json",
     "-show_format",
     "-show_streams",
@@ -4707,8 +4803,8 @@ async function extractNzbgetArchives(input) {
   };
 }
 
-async function arrQueueDetails(serviceName) {
-  const records = await arrApi(serviceName, "v3", "queue/details");
+async function arrQueueDetails(serviceName, options = {}) {
+  const records = await arrApi(serviceName, "v3", "queue/details", options);
   return Array.isArray(records) ? records : [];
 }
 
@@ -4728,7 +4824,8 @@ function recordsById(records, ids) {
 
 async function removeArrQueueItems(serviceName, ids, options) {
   const uniqueIds = uniquePositiveIds(ids);
-  const beforeRecords = await arrQueueDetails(serviceName);
+  const requestOptions = options.requestOptions || (() => ({}));
+  const beforeRecords = await arrQueueDetails(serviceName, requestOptions());
   const matchedBefore = recordsById(beforeRecords, uniqueIds);
   const missingBefore = uniqueIds.filter(id => !matchedBefore.some(record => record.id === id));
   const query = {
@@ -4753,14 +4850,14 @@ async function removeArrQueueItems(serviceName, ids, options) {
   const deleteResults = [];
   for (const id of uniqueIds) {
     try {
-      await arrApi(serviceName, "v3", `queue/${id}`, { method: "DELETE", query });
+      await arrApi(serviceName, "v3", `queue/${id}`, { method: "DELETE", query, ...requestOptions() });
       deleteResults.push({ id, ok: true });
     } catch (error) {
       deleteResults.push({ id, ok: false, error: error.message });
     }
   }
 
-  const afterRecords = await arrQueueDetails(serviceName);
+  const afterRecords = await arrQueueDetails(serviceName, requestOptions());
   const remainingAfter = recordsById(afterRecords, uniqueIds);
   return {
     dryRun: false,
@@ -6331,182 +6428,11 @@ async function mediaPublicTitleSummary({ title, mediaType, year }) {
   };
 }
 
-function publicDurationSeconds(value) {
-  if (typeof value !== "number" && typeof value !== "string") {
-    return null;
-  }
-  const text = String(value).trim().toLowerCase();
-  if (!text) {
-    return null;
-  }
-  if (/^\d+(?:\.\d+)?$/.test(text)) {
-    const seconds = Math.floor(Number(text));
-    return Number.isSafeInteger(seconds) ? seconds : null;
-  }
-  // Tautulli formats totals as whole duration components. Reject any extra
-  // text, negative sign or unknown unit instead of accepting a partial match.
-  const component = "\\d+(?:\\.\\d+)?\\s*(?:days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)";
-  if (!new RegExp(`^${component}(?:\\s+${component})*$`).test(text)) {
-    return null;
-  }
-  const sizes = {
-    day: 24 * 60 * 60,
-    days: 24 * 60 * 60,
-    hr: 60 * 60,
-    hrs: 60 * 60,
-    hour: 60 * 60,
-    hours: 60 * 60,
-    min: 60,
-    mins: 60,
-    minute: 60,
-    minutes: 60,
-    sec: 1,
-    secs: 1,
-    second: 1,
-    seconds: 1
-  };
-  let seconds = 0;
-  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)/g)) {
-    seconds += Number(match[1]) * sizes[match[2]];
-  }
-  return Number.isSafeInteger(Math.floor(seconds)) ? Math.floor(seconds) : null;
-}
-
-function tautulliPublicHistoryMediaType(row) {
-  const type = String(row?.media_type || row?.mediaType || "").trim().toLowerCase();
-  if (["episode", "season", "show"].includes(type)) {
-    return "tv";
-  }
-  return type === "movie" ? "movie" : "";
-}
-
-function tautulliPublicHistoryMatches(row, { title, mediaType, year }) {
-  const rowMediaType = tautulliPublicHistoryMediaType(row);
-  if (mediaType && rowMediaType !== mediaType) {
-    return false;
-  }
-  if (title) {
-    const candidates = rowMediaType === "tv"
-      ? [row?.grandparent_title, row?.grandparentTitle]
-      : [row?.title, row?.full_title, row?.fullTitle];
-    if (!candidates.map(publicTitleKey).filter(Boolean).includes(publicTitleKey(title))) {
-      return false;
-    }
-  }
-  const requestedYear = publicYear(year);
-  const rowYear = publicYear(
-    rowMediaType === "tv"
-      ? row?.grandparent_year ?? row?.grandparentYear
-      : row?.year
-  );
-  return !requestedYear || !rowYear || requestedYear === rowYear;
-}
-
-function tautulliPublicHistoryQuery({ title, mediaType, periodStartDate }) {
-  return {
-    grouping: 0,
-    include_activity: 0,
-    after: periodStartDate,
-    order_column: "date",
-    order_dir: "desc",
-    ...(title ? { search: title } : {}),
-    ...(mediaType ? { media_type: mediaType === "tv" ? "episode" : "movie" } : {})
-  };
-}
-
-async function tautulliPublicHistoryTotals(input, periodStartDate) {
-  const query = tautulliPublicHistoryQuery({ ...input, periodStartDate });
-  if (!input.title) {
-    const summary = await tautulliApi("get_history", {
-      query: { ...query, start: 0, length: 1 }
-    });
-    const playCount = Number(summary?.recordsFiltered);
-    // get_history's filter_duration sums only the returned page (length=1).
-    // total_duration applies the same date/media-type custom_where across all
-    // matching history. Search text is not part of that total, so exact-title
-    // queries must continue through the bounded row-filtering path below.
-    const totalWatchSeconds = publicDurationSeconds(summary?.total_duration);
-    if (Number.isFinite(playCount) && playCount >= 0 && totalWatchSeconds !== null) {
-      return {
-        playCount: Math.floor(playCount),
-        totalWatchSeconds,
-        complete: true
-      };
-    }
-  }
-
-  const pageSize = 1000;
-  const maximumRows = 50_000;
-  let start = 0;
-  let expectedRows = null;
-  let playCount = 0;
-  let totalWatchSeconds = 0;
-  while (start < maximumRows) {
-    const requestedLength = Math.min(pageSize, maximumRows - start);
-    const page = await tautulliApi("get_history", {
-      query: {
-        ...query,
-        start,
-        length: requestedLength
-      }
-    });
-    const rows = tautulliTableRows(page);
-    const filteredTotal = Number(page?.recordsFiltered);
-    if (Number.isFinite(filteredTotal) && filteredTotal >= 0) {
-      expectedRows = Math.floor(filteredTotal);
-    }
-    for (const row of rows) {
-      if (!tautulliPublicHistoryMatches(row, input)) {
-        continue;
-      }
-      playCount += 1;
-      totalWatchSeconds += publicInteger(row?.duration);
-    }
-    start += rows.length;
-    if (
-      !rows.length
-      || (expectedRows !== null ? start >= expectedRows : rows.length < requestedLength)
-    ) {
-      break;
-    }
-  }
-  return {
-    playCount,
-    totalWatchSeconds,
-    complete: expectedRows === null ? start < maximumRows : start >= expectedRows
-  };
-}
-
-async function mediaPublicWatchtimeSummary({ title, mediaType, year, periodDays }) {
-  if (!configuredServices.tautulli) {
-    return { configured: false, available: false };
-  }
-  const days = Math.min(366, Math.max(1, publicInteger(periodDays) || 30));
-  const now = new Date();
-  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const periodStart = new Date(today - (days - 1) * 24 * 60 * 60 * 1000);
-  try {
-    const totals = await tautulliPublicHistoryTotals({
-      title: String(title || "").trim(),
-      mediaType,
-      year
-    }, periodStart.toISOString().slice(0, 10));
-    return {
-      configured: true,
-      available: true,
-      generatedAt: now.toISOString(),
-      periodDays: days,
-      periodStart: periodStart.toISOString(),
-      periodEnd: now.toISOString(),
-      scope: title ? "title" : "library",
-      mediaType: mediaType || "all",
-      matched: title ? totals.playCount > 0 : undefined,
-      ...totals
-    };
-  } catch {
-    return { configured: true, available: false };
-  }
-}
+const mediaPublicWatchtimeSummary = createPublicWatchtimeSummary({
+  api: tautulliApi,
+  configured: () => Boolean(configuredServices.tautulli),
+  timeoutMs: Math.min(25000, requestTimeoutMs)
+});
 
 async function plexPublicBandwidthSummary() {
   if (!configuredServices.plex) {
@@ -6713,6 +6639,17 @@ function plexRecentPublicRecord(record) {
       addedAt
     };
   }
+  if (type === "season") {
+    return {
+      mediaType: "tv",
+      title: String(record?.parentTitle || record?.title || "").trim(),
+      year: publicYear(record?.parentYear),
+      seasonNumber: publicInteger(record?.index),
+      seasonTitle: String(record?.title || "").trim(),
+      episodeCount: publicInteger(record?.leafCount ?? record?.childCount),
+      addedAt
+    };
+  }
   if (type === "show") {
     return {
       mediaType: "tv",
@@ -6724,32 +6661,57 @@ function plexRecentPublicRecord(record) {
   return null;
 }
 
-async function mediaPublicRecentAdditions({ mediaType, limit }) {
+async function mediaPublicRecentAdditions({ mediaType, limit, offset: requestedOffset = 0 }) {
   if (!configuredServices.plex) {
     return { configured: false, available: false, records: [] };
   }
+  const found = [];
+  const seen = new Set();
+  const pageSize = Math.min(100, Math.max(25, limit * 4));
+  const budgetMs = Math.min(25000, requestTimeoutMs);
+  const deadline = Date.now() + budgetMs;
+  const signal = AbortSignal.timeout(budgetMs);
+  let offset = requestedOffset;
+  let exhausted = false;
+  let nextOffset = offset;
+  let incompleteReason;
+  let requestCount = 0;
   try {
-    const body = await plexApi("library/recentlyAdded", {
-      query: {
-        "X-Plex-Container-Start": 0,
-        "X-Plex-Container-Size": Math.min(100, Math.max(limit * 4, limit))
+    // A mixed recent-additions page may contain no requested type. Continue
+    // within a fixed budget instead of presenting that page as an empty library.
+    for (let page = 0; page < 5 && found.length < limit; page += 1) {
+      if (signal.aborted || Date.now() >= deadline) { incompleteReason = "work_budget_exhausted"; break; }
+      requestCount++;
+      const { records, pagination } = await plexMetadataPage("library/recentlyAdded", { offset, limit: pageSize, signal, timeoutMs: Math.max(1, deadline - Date.now()) });
+      let added = 0;
+      for (const [index, record] of records.entries()) {
+        nextOffset = offset + index + 1;
+        const key = String(record.ratingKey || record.key || JSON.stringify([record.type, record.title, record.addedAt]));
+        if (seen.has(key)) continue;
+        seen.add(key);
+        added += 1;
+        const projected = plexRecentPublicRecord(record);
+        if (projected && (!mediaType || projected.mediaType === mediaType)) found.push(projected);
+        if (found.length >= limit) break;
       }
-    });
-    const records = (Array.isArray(body?.MediaContainer?.Metadata) ? body.MediaContainer.Metadata : [])
-      .map(plexRecentPublicRecord)
-      .filter(Boolean)
-      .filter(record => !mediaType || record.mediaType === mediaType)
-      .sort((left, right) => String(right.addedAt || "").localeCompare(String(left.addedAt || "")))
-      .slice(0, limit);
-    return {
-      configured: true,
-      available: true,
-      generatedAt: new Date().toISOString(),
-      records
-    };
+      exhausted = pagination.complete && nextOffset >= offset + records.length;
+      if (exhausted) { nextOffset = null; break; }
+      if (found.length >= limit) break;
+      if (!added || pagination.nextOffset === null) { incompleteReason = "incomplete_upstream_page"; nextOffset = null; break; }
+      offset = pagination.nextOffset;
+      nextOffset = offset;
+    }
   } catch {
-    return { configured: true, available: false, records: [] };
+    incompleteReason = signal.aborted || Date.now() >= deadline ? "work_budget_exhausted" : "upstream_unavailable";
   }
+  const records = found.sort((left, right) => String(right.addedAt || "").localeCompare(String(left.addedAt || ""))).slice(0, limit);
+  const complete = exhausted || records.length >= limit;
+  return {
+    configured: true, available: complete || requestCount > 0 && !incompleteReason || records.length > 0,
+    generatedAt: new Date().toISOString(), complete, truncated: !complete,
+    ...(complete ? {} : { incompleteReason: incompleteReason || "work_budget_exhausted" }),
+    offset: requestedOffset, nextOffset, requestCount, records
+  };
 }
 
 function seerrPublicSearchRecord(record) {
@@ -10051,21 +10013,6 @@ async function listQbitTorrentInfo() {
   return Array.isArray(body) ? body : [];
 }
 
-function matchAddedQbitTorrent(before, after, release, input) {
-  const beforeHashes = new Set(before.map(record => String(record.hash || "")));
-  const added = after.find(record => record.hash && !beforeHashes.has(String(record.hash)));
-  if (added) {
-    return added;
-  }
-  const category = String(input.category || "");
-  const title = String(release.title || release.guid || "").toLowerCase();
-  return after.find(record => {
-    const name = String(record.name || "").toLowerCase();
-    const recordCategory = String(record.category || "");
-    return (!category || recordCategory === category) && (!title || name.includes(title.slice(0, Math.min(title.length, 40))));
-  }) || null;
-}
-
 async function qbittorrentAddProwlarrRelease(input) {
   const release = buildProwlarrReleasePayload(input);
   const request = compactObject({
@@ -10086,17 +10033,19 @@ async function qbittorrentAddProwlarrRelease(input) {
     };
   }
 
-  const before = await listQbitTorrentInfo();
   const addResult = await qbitRequest("torrents/add", {
     method: "POST",
     form: qbitAddForm(input, release)
   });
   const after = await listQbitTorrentInfo();
-  const torrent = matchAddedQbitTorrent(before, after, release, input);
+  const torrent = exactTorrentFromAddResult(after, release, addResult);
+  const accepted = typeof addResult === "string" ? /^ok\.?$/i.test(addResult.trim()) : !(addResult?.failure_count > 0 && !(addResult?.success_count > 0) && !(addResult?.pending_count > 0));
   return {
     dryRun: false,
     service: "qbittorrent",
-    added: true,
+    added: Boolean(torrent),
+    accepted,
+    pending: accepted && !torrent,
     release: summarizeProwlarrReleaseCandidate(release),
     request,
     trackedDownloadId: torrent?.hash || null,
@@ -10104,7 +10053,7 @@ async function qbittorrentAddProwlarrRelease(input) {
     addResult: redactSensitiveObject(addResult),
     note: torrent?.hash
       ? "qBittorrent accepted the exact Prowlarr release. Use the trackedDownloadId to monitor import from Sonarr."
-      : "qBittorrent accepted the release, but no new torrent hash was visible in the immediate post-add torrent list."
+      : accepted ? "URL submission is pending or unverified. No exact torrent hash was established; use qbittorrent_import_prowlarr_torrent for a managed byte handoff." : "qBittorrent rejected the URL submission. No torrent was verified."
   };
 }
 
@@ -11254,6 +11203,7 @@ function createServer() {
     name: "unraid-codex-media-mcp",
     version: "0.1.0"
   });
+  registerDownloadRepairTools(server, { z, jsonText, capabilities: downloadRepairCapabilities });
 
   server.registerTool("media_services_status", {
     title: "Media Services Status",
@@ -11333,10 +11283,16 @@ function createServer() {
 
   server.registerTool("media_public_watchtime_summary", {
     title: "Privacy-Safe Aggregate Watch-Time Summary",
-    description: "Return aggregate Plex play count and watch time for a bounded period, optionally for one exact title, without users, devices, paths, service IDs, or raw history records.",
+    description: "Return aggregate play count and watch time for all recorded history (default), any positive day/month/year lookback, or inclusive YYYY-MM-DD dates, optionally for an exact title. No calendar-span cap. Work is bounded by time and API requests; incomplete results supply nextCursor for cumulative continuation. Never narrow the requested timeframe. No users, devices, paths, service IDs, or raw history records.",
     annotations: { readOnlyHint: true },
     inputSchema: {
-      periodDays: z.number().int().min(1).max(366).default(30),
+      allTime: z.boolean().optional(),
+      periodDays: z.number().int().positive().optional(),
+      periodMonths: z.number().int().positive().optional(),
+      periodYears: z.number().int().positive().optional(),
+      startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      cursor: z.string().min(1).max(100).optional(),
       title: z.string().min(1).max(200).optional(),
       mediaType: z.enum(["tv", "movie"]).optional(),
       year: z.number().int().min(1870).max(2100).optional()
@@ -11380,10 +11336,11 @@ function createServer() {
 
   server.registerTool("media_public_recent_additions", {
     title: "Privacy-Safe Recent Media Additions",
-    description: "Return a bounded list of recently added public media titles and dates without users, paths, service IDs, or raw records.",
+    description: "Return recently added public media titles and dates without users, paths, service IDs, or raw records. Bounded work returns nextOffset so callers can continue the same media-type scope instead of treating a partial page as absence.",
     annotations: { readOnlyHint: true },
     inputSchema: {
       mediaType: z.enum(["tv", "movie"]).optional(),
+      offset: z.number().int().min(0).default(0),
       limit: z.number().int().min(1).max(10).default(5)
     }
   }, async (input) => jsonText(await mediaPublicRecentAdditions(input)));
@@ -11472,6 +11429,7 @@ function createServer() {
   }, async ({ requestId, verbose }) => jsonText(await requestTriage(requestId, verbose)));
 
   registerThreadfinTools(server);
+  registerPlexDiagnosticsTools(server, { plexApi, getService: () => requireService("plex"), redactText, jsonText });
 
   server.registerTool("plex_status", {
     title: "Plex Status",
@@ -11539,7 +11497,8 @@ function createServer() {
     annotations: { readOnlyHint: true },
     inputSchema: {
       ratingKey: z.union([z.string(), z.number()]),
-      limit: z.number().int().min(1).max(250).default(100)
+      limit: z.number().int().min(1).max(250).default(100),
+      offset: z.number().int().min(0).default(0)
     }
   }, async (input) => jsonText(await plexListSeasonChildren(input)));
 
@@ -11549,7 +11508,8 @@ function createServer() {
     annotations: { readOnlyHint: true },
     inputSchema: {
       ratingKey: z.union([z.string(), z.number()]),
-      limit: z.number().int().min(1).max(250).default(100)
+      limit: z.number().int().min(1).max(250).default(100),
+      offset: z.number().int().min(0).default(0)
     }
   }, async (input) => jsonText(await plexListShowSeasons(input)));
 
@@ -11596,7 +11556,7 @@ function createServer() {
     }
   }, async (input) => jsonText(await plexDeleteMetadata(input)));
 
-  server.registerTool("plex_scan_library_path", {
+  for (const name of ["plex_scan_library_path", "plex_scan_section_path"]) server.registerTool(name, {
     title: "Working Plex Path Scan And Metadata Refresh",
     description: "Run a Plex library section path scan plus optional rating-key refresh/analyze after media files are replaced. Can infer section and part paths from a rating key. Dry-run is enabled by default.",
     annotations: { destructiveHint: false, idempotentHint: false },
@@ -12109,7 +12069,7 @@ function createServer() {
 
   server.registerTool("sonarr_blocklist_history_without_retry", {
     title: "Sonarr Imported-Source Blocklist Without Retry",
-    description: "Mark one exact imported Sonarr history source failed, then detect and remove replacement queue items in the same episode scope with blocklist and skipRedownload enabled. Monitoring is not changed. Dry-run is enabled by default.",
+    description: "Mark one exact imported Sonarr source failed, observe the resulting scoped search commands, and remove replacement queue items with skipRedownload. Success requires those searches to finish and no replacement remaining; bounded waiting may return incomplete. Monitoring is not changed. Dry-run first.",
     annotations: { destructiveHint: true, idempotentHint: false },
     inputSchema: {
       episodeFileIds: z.array(z.number().int().positive()).max(20).optional(),
@@ -12122,7 +12082,7 @@ function createServer() {
       languages: z.array(z.any()).optional(),
       message: z.string().min(1).optional(),
       historyLimit: z.number().int().min(1).max(50).default(10),
-      settleMs: z.number().int().min(0).max(15000).default(5000),
+      settleMs: z.number().int().min(0).max(60000).default(15000),
       dryRun: z.boolean().default(true)
     }
   }, async (input) => jsonText(await sonarrBlocklistHistoryWithoutRetry(input)));
@@ -13421,6 +13381,15 @@ function createServer() {
     return jsonText(await seerrApi(`request/${requestId}/${action}`, { method: "POST" }));
   });
 
+  registerMediaFilesystemTools(server, {
+    roots: mediaDeleteRootSummary(), pathMaps: mediaPathMaps,
+    readTarget: resolveMediaReadTarget, readCandidates: mediaReadPathCandidates,
+    plexFile: async input => {
+      const { plexParts } = await plexProbePartsFromRatingKey(input);
+      return plexParts[input.partIndex || 0]?.file;
+    },
+    findExecutable, timeoutMs: mediaProbeCommandTimeoutMs, jsonText
+  });
   return server;
 }
 

@@ -45,6 +45,7 @@ async function run() {
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - (days - 1) * 86400_000).toISOString().slice(0, 10);
   };
   let historyOverride = null;
+  let recentOverride = null;
   const fallbackHistoryRows = [
     { media_type: "movie", title: "Private Watch Record", duration: 207, friendly_name: "Private User", user_id: 7001, player: "private-device" },
     { media_type: "episode", grandparent_title: "Private Series", duration: 3600, friendly_name: "Another Private User", user_id: 7002 },
@@ -163,9 +164,11 @@ async function run() {
       });
     }
     if (url.pathname === "/plex/library/recentlyAdded") {
-      return sendJson(res, 200, {
-        MediaContainer: {
-          Metadata: [{
+      const recentRecords = recentOverride || [{
+            ratingKey: "private-season-key", key: "/library/metadata/private-season-key/children",
+            type: "season", index: 5, title: "The Story (Season 5)", parentTitle: "The Great Escape",
+            addedAt: currentMonthSeconds + 120, leafCount: 10, viewedLeafCount: 2
+          }, {
             ratingKey: "private-rating-key",
             type: "movie",
             title: "Recent Fixture",
@@ -181,9 +184,10 @@ async function run() {
             index: 4,
             title: "Recent Episode",
             addedAt: currentMonthSeconds - 60
-          }]
-        }
-      });
+          }];
+      const offset = Number(url.searchParams.get("X-Plex-Container-Start")) || 0;
+      const size = Number(url.searchParams.get("X-Plex-Container-Size")) || 100;
+      return sendJson(res, 200, { MediaContainer: { totalSize: recentRecords.length, Metadata: recentRecords.slice(offset, offset + size) } });
     }
     if (url.pathname === "/bazarr/api/movies/wanted") {
       return sendJson(res, 200, { total: 7, data: [{ path: "/private/movie.srt" }] });
@@ -212,7 +216,8 @@ async function run() {
     if (url.pathname === "/tautulli/api/v2" && url.searchParams.get("cmd") === "get_history") {
       assert.equal(url.searchParams.get("grouping"), "0");
       assert.equal(url.searchParams.get("include_activity"), "0");
-      assert.match(url.searchParams.get("after"), /^\d{4}-\d{2}-\d{2}$/);
+      if (url.searchParams.has("after")) assert.match(url.searchParams.get("after"), /^\d{4}-\d{2}-\d{2}$/);
+      if (url.searchParams.has("before")) assert.match(url.searchParams.get("before"), /^\d{4}-\d{2}-\d{2}$/);
       if (url.searchParams.get("search") === "Fixture Series") {
         assert.equal(url.searchParams.get("media_type"), "episode");
         return sendJson(res, 200, {
@@ -422,6 +427,33 @@ async function run() {
     assert.equal(aggregateCall.query.length, "1");
     assert.equal(aggregateCall.query.after, periodStartDate(365));
 
+    for (const scope of [{}, { allTime: true }]) {
+      const start = calls.length;
+      const allTime = await tool("media_public_watchtime_summary", scope);
+      assert.equal(allTime.period, "all_time");
+      assert.equal(allTime.allTime, true);
+      assert.equal(allTime.periodDays, null);
+      assert.equal(allTime.periodStart, null);
+      assert.equal(allTime.complete, true);
+      assert.equal(allTime.playCount, 23480);
+      assert.equal(allTime.totalWatchSeconds, aggregateWatchtime.totalWatchSeconds);
+      assert.equal(calls.length, start + 1, "all-history library total uses one aggregate query");
+      assert.equal(calls.at(-1).query.after, undefined);
+      assert.equal(calls.at(-1).query.before, undefined);
+    }
+    const multiYear = await tool("media_public_watchtime_summary", { periodDays: 1826 });
+    assert.equal(multiYear.periodDays, 1826);
+    assert.equal(calls.at(-1).query.after, periodStartDate(1826));
+    const calendarYears = await tool("media_public_watchtime_summary", { periodYears: 5 });
+    assert.equal(calendarYears.periodYears, 5);
+    assert.ok(calendarYears.periodDays >= 1826);
+    const requestedRange = await tool("media_public_watchtime_summary", { startDate: "2012-02-29", endDate: "2024-12-31" });
+    assert.equal(requestedRange.period, "date_range");
+    assert.equal(calls.at(-1).query.after, "2012-02-29");
+    assert.equal(calls.at(-1).query.before, "2024-12-31");
+    const invalidScope = await rpc("tools/call", { name: "media_public_watchtime_summary", arguments: { allTime: true, periodDays: 365 } });
+    assert.equal(invalidScope.result.isError, true);
+
     const weeklyWatchtime = await tool("media_public_watchtime_summary", { periodDays: 7 });
     assert.equal(weeklyWatchtime.playCount, 42);
     assert.equal(weeklyWatchtime.totalWatchSeconds, 14 * 3600 + 30 * 60);
@@ -451,6 +483,12 @@ async function run() {
     assert.equal(titleWatchtime.playCount, 2);
     assert.equal(titleWatchtime.totalWatchSeconds, 2700);
     assert.equal(titleWatchtime.complete, true);
+    const lifetimeTitle = await tool("media_public_watchtime_summary", { allTime: true, title: "Fixture Series", mediaType: "tv", year: 2024 });
+    assert.equal(lifetimeTitle.complete, true);
+    assert.equal(lifetimeTitle.playCount, 2);
+    assert.equal(lifetimeTitle.totalWatchSeconds, 2700);
+    assert.equal(calls.at(-1).query.after, undefined);
+    assert.equal(calls.at(-1).query.before, undefined);
 
     const fallbackResults = [];
     for (const total of [undefined, null, "", "not available", "4 hrs unavailable", "-4 hrs", "1 hr 2 milliseconds", "3 minutesgarbage", false, [], "0x100", Infinity]) {
@@ -481,11 +519,20 @@ async function run() {
     historyOverride = { summary: {}, rowCount: 50001 };
     const boundedStart = calls.length;
     const boundedWatchtime = await tool("media_public_watchtime_summary", { periodDays: 365 });
-    assert.equal(boundedWatchtime.playCount, 50000);
-    assert.equal(boundedWatchtime.totalWatchSeconds, 50000);
+    assert.equal(boundedWatchtime.playCount, 19000);
+    assert.equal(boundedWatchtime.totalWatchSeconds, 19000);
     assert.equal(boundedWatchtime.complete, false);
-    assert.equal(calls.length - boundedStart, 51);
-    assert.equal(calls.at(-1).query.start, "49000");
+    assert.equal(boundedWatchtime.incompleteReason, "work_budget_exhausted");
+    assert.equal(calls.length - boundedStart, 20);
+    assert.equal(calls.at(-1).query.start, "18000");
+    const continuedWatchtime = await tool("media_public_watchtime_summary", { cursor: boundedWatchtime.nextCursor });
+    assert.equal(continuedWatchtime.playCount, 39000, "continuations contain cumulative totals, not a second batch to add");
+    assert.equal(continuedWatchtime.complete, false);
+    const completedWatchtime = await tool("media_public_watchtime_summary", { cursor: continuedWatchtime.nextCursor });
+    assert.equal(completedWatchtime.playCount, 50001);
+    assert.equal(completedWatchtime.totalWatchSeconds, 50001);
+    assert.equal(completedWatchtime.complete, true);
+    assert.equal(completedWatchtime.nextCursor, undefined);
     historyOverride = null;
 
     const bandwidth = await tool("plex_public_bandwidth_summary");
@@ -512,9 +559,41 @@ async function run() {
     assert.equal(subtitles.configuredProviderCount, 2);
 
     const recent = await tool("media_public_recent_additions", { limit: 5 });
-    assert.equal(recent.records.length, 2);
-    assert.equal(recent.records[0].title, "Recent Fixture");
+    assert.equal(recent.records.length, 3);
+    assert.equal(recent.records[0].title, "The Great Escape");
+    assert.equal(recent.records[0].seasonNumber, 5);
+    assert.equal(recent.records[0].seasonTitle, "The Story (Season 5)");
+    assert.equal(recent.records[0].episodeCount, 10);
+    assert.ok(recent.records[0].addedAt);
     assert.equal(Object.hasOwn(recent.records[0], "ratingKey"), false);
+    const recentTv = await tool("media_public_recent_additions", { mediaType: "tv", limit: 1 });
+    assert.equal(recentTv.records[0].title, "The Great Escape");
+    const recentMovie = index => ({ ratingKey: `private-movie-${index}`, type: "movie", title: `Movie ${index}`, addedAt: currentMonthSeconds - index });
+    recentOverride = [...Array.from({ length: 26 }, (_, index) => recentMovie(index)), { type: "season", ratingKey: "private-paged-season", parentTitle: "Paged Show", title: "Season 5", index: 5, leafCount: 10, addedAt: currentMonthSeconds - 30 }];
+    const recentStart = calls.length;
+    const recentPaged = await tool("media_public_recent_additions", { mediaType: "tv", limit: 1 });
+    assert.equal(recentPaged.records[0].title, "Paged Show");
+    assert.deepEqual(calls.slice(recentStart).map(call => call.query["X-Plex-Container-Start"]), ["0", "25"]);
+    recentOverride = Array.from({ length: 200 }, (_, index) => recentMovie(index));
+    const cappedStart = calls.length;
+    const recentCapped = await tool("media_public_recent_additions", { mediaType: "tv", limit: 1 });
+    assert.deepEqual(recentCapped.records, []);
+    assert.equal(recentCapped.complete, false);
+    assert.equal(recentCapped.truncated, true);
+    assert.equal(calls.length - cappedStart, 5);
+    assert.equal(recentCapped.nextOffset, 125);
+    recentOverride.push({ type: "season", ratingKey: "private-late-season", parentTitle: "Older Addition", title: "Season 7", index: 7, addedAt: currentMonthSeconds - 300 });
+    const continuedRecent = await tool("media_public_recent_additions", { mediaType: "tv", limit: 1, offset: recentCapped.nextOffset });
+    assert.equal(continuedRecent.records[0].title, "Older Addition");
+    assert.equal(continuedRecent.complete, true);
+    assert.equal(continuedRecent.nextOffset, null);
+    recentOverride = [recentMovie(1), recentMovie(2), recentMovie(3)];
+    const firstRecentPage = await tool("media_public_recent_additions", { mediaType: "movie", limit: 1 });
+    assert.equal(firstRecentPage.records[0].title, "Movie 1");
+    assert.equal(firstRecentPage.nextOffset, 1, "continuation cannot skip unreturned items from the same upstream page");
+    const secondRecentPage = await tool("media_public_recent_additions", { mediaType: "movie", limit: 1, offset: firstRecentPage.nextOffset });
+    assert.equal(secondRecentPage.records[0].title, "Movie 2");
+    recentOverride = null;
 
     const request = await tool("media_public_request_status", {
       title: "Fixture Request",
@@ -540,6 +619,7 @@ async function run() {
       queues,
       subtitles,
       recent,
+      recentTv, recentPaged, recentCapped,
       request
     });
     assert.doesNotMatch(allResults, /\/private|accountID|deviceID|ratingKey|requestedBy|private@|Private User|private-machine|private-version/i);

@@ -342,6 +342,8 @@ ssh -t unraid-codex codex login
 
 ## Optional Media MCP
 
+The [capability backlog audit](media-mcp/CAPABILITY-GAPS.md) maps the recorded missing tools to their implementations and remaining upstream limits. It covers Plex season/addition evidence, scan and playback diagnostics, exact download handoffs and import watching, release suppression, mapped file probes, compatibility copies, and subtitle timing tools. Mutation tools retain dry-run defaults and the issue agent's repair approval gate; private session/log tools remain outside public Slack research.
+
 `media-mcp` exposes a single `media` MCP server with a conservative first-party tool set:
 
 - Shared: configured service status, compact media admin overview, diagnostics bundles, exact queue-item diagnosis, exact queue repair plans, issue diagnosis, request triage, scoped media file deletion, and video content probing.

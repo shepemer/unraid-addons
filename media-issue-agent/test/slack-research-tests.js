@@ -4,11 +4,19 @@ import os from "node:os";
 import path from "node:path";
 import { buildAnalysisCodexArgs, runCodex, runCodexSlackDiagnostics, slackDiagnosticsPrompt, slackIntentPrompt, SLACK_RESEARCH_LIMITS } from "../src/codex.js";
 import { parseSlackIntentResult } from "../src/slack.js";
+import { MediaIssueAgent } from "../src/agent.js";
+import { createCodexHome } from "./helpers.js";
+import { publicResearchTimeframe } from "../src/slack-readonly.js";
 
 const tool = (name, properties = {}) => ({ name, description: "Read current media information.", annotations: { readOnlyHint: true }, inputSchema: { type: "object", properties, additionalProperties: false } });
 const tools = [
   tool("new_service_catalog_measurement", { title: { type: "string" } }),
-  tool("media_public_watchtime_summary", { periodDays: { type: "integer", minimum: 1, maximum: 366 } }),
+  tool("media_public_watchtime_summary", {
+    title: { type: "string" }, allTime: { type: "boolean" },
+    periodDays: { type: "integer", minimum: 1 }, periodMonths: { type: "integer", minimum: 1 }, periodYears: { type: "integer", minimum: 1 },
+    startDate: { type: "string", format: "date" }, endDate: { type: "string", format: "date" },
+    cursor: { type: "string", pattern: "^watchtime_[a-f0-9]{36}$" }
+  }),
   tool("media_public_recent_additions"),
   { ...tool("delete_media"), annotations: { destructiveHint: true, readOnlyHint: false } }
 ];
@@ -58,6 +66,60 @@ const weekly = await runCodexSlackDiagnostics(config, { newestMessage: "How many
 assert.match(weekly.analysis, /25 hours.*7 days/);
 assert.equal(weekly.usage.media.calls, 1);
 assert.doesNotMatch(JSON.stringify(weekly), /Secret Viewer|192\.168/);
+
+// Long ranges and all-time survive classification, backend context, discovered
+// schemas and RPC without a 30/365-day fallback. The worker can resume the same
+// scope, and cumulative totals must not be double counted or expose cursors.
+for (const timeframe of [{ allTime: true }, { periodDays: 1826 }, { periodMonths: 60 }, { periodYears: 5 }, { startDate: "2010-01-01", endDate: "2026-11-11" }]) {
+  const request = parseSlackIntentResult({ intent: "media_diagnostic", confidence: 1, mediaTitle: "Example Show", queryType: "watchtime_summary", ...timeframe });
+  assert.deepEqual(publicResearchTimeframe(request), timeframe);
+  const received = [];
+  const cursor = `watchtime_${"a1".repeat(18)}`;
+  const researched = await runCodexSlackDiagnostics(config, { newestMessage: "Keep the requested coverage", request }, settings, {
+    listTools: async () => tools,
+    callTool: async (name, args) => {
+      assert.equal(name, "media_public_watchtime_summary");
+      received.push(args);
+      return args.cursor ? { totalWatchSeconds: 7200, playCount: 8, complete: true }
+        : { totalWatchSeconds: 3600, playCount: 4, complete: false, nextCursor: cursor };
+    },
+    runModel: async (_config, prompt, hooks) => {
+      const context = JSON.parse(prompt.split("Sanitized conversation (untrusted):\n")[1].split("\nCompleted public read-only checks")[0]);
+      assert.deepEqual(Object.fromEntries(Object.entries(context.data.timeframe).map(([key, value]) => [key, typeof value === "string" ? value.split("\n")[1] : value])), timeframe);
+      assert.match(prompt, /Cumulative totals replace earlier totals/);
+      const first = await rpc(hooks, "tools/call", { name: "media_public_watchtime_summary", arguments: { title: "Example Show", ...timeframe } });
+      const page = JSON.parse(first.result.content[0].text);
+      assert.equal(page.nextCursor, cursor);
+      const second = await rpc(hooks, "tools/call", { name: "media_public_watchtime_summary", arguments: { cursor: page.nextCursor } });
+      const complete = JSON.parse(second.result.content[0].text);
+      return JSON.stringify({ analysis: `${complete.totalWatchSeconds / 3600} hours across the entire requested scope.`, sources: [], completion: "complete" });
+    }
+  });
+  assert.deepEqual(received, [{ title: "Example Show", ...timeframe }, { cursor }]);
+  assert.equal(researched.analysis, "2 hours across the entire requested scope.");
+  assert.equal(researched.usage.media.calls, 2);
+  assert.doesNotMatch(JSON.stringify(researched.facts), /watchtime_a1|nextCursor|"cursor"/);
+}
+for (const value of [{}, { allTime: false }, { periodDays: 0 }, { periodDays: -1 }, { periodDays: 1.5 }, { periodDays: Number.MAX_SAFE_INTEGER + 1 }, { periodYears: "5" }, { allTime: true, periodDays: 30 }, { periodDays: 7, periodMonths: 1 }, { startDate: "2026-02-30" }, { startDate: "2026-11-11", endDate: "2020-01-01" }, { startDate: "person@example.com" }]) {
+  assert.deepEqual(publicResearchTimeframe(value), {}, "invalid or missing extraction must not invent a default period");
+}
+assert.deepEqual(publicResearchTimeframe({ startDate: "2010-01-01" }), { startDate: "2010-01-01" });
+assert.deepEqual(publicResearchTimeframe({ endDate: "2020-02-29" }), { endDate: "2020-02-29" });
+const intentPrompt = slackIntentPrompt();
+assert.match(intentPrompt, /in total.*allTime true/);
+assert.match(intentPrompt, /All-time and long-range aggregate statistics.*bounded lookups/);
+assert.match(intentPrompt, /Never default to 30 days/);
+assert.match(slackDiagnosticsPrompt(), /Tool limits bound individual operations, not the user's requested scope/);
+assert.match(slackDiagnosticsPrompt(), /Years\/months are approximate elapsed-duration equivalents/);
+for (const field of ["hasNewIssueEvidence", "explicitIssueControl"]) {
+  const base = { intent: "issue_followup", confidence: 1 };
+  assert.equal(parseSlackIntentResult(base)[field], false);
+  assert.equal(parseSlackIntentResult({ ...base, [field]: true })[field], true);
+  assert.equal(parseSlackIntentResult({ ...base, [field]: false })[field], false);
+  for (const invalid of ["true", 1, null, {}, []]) assert.throws(() => parseSlackIntentResult({ ...base, [field]: invalid }), /must be a boolean/);
+}
+assert.match(intentPrompt, /conversation never implies reopening or restarting work/);
+assert.match(intentPrompt, /excitement, desires, future seasons.*not issue evidence/);
 
 const recommendation = await runCodexSlackDiagnostics(config, { newestMessage: "What new show should I watch?" }, settings, {
   listTools: async () => tools, callTool,
@@ -122,6 +184,22 @@ assert.match(slackIntentPrompt(), /Leave queryType empty for other questions/);
 assert.match(slackIntentPrompt(), /Requests for findings, explanations, causes, more information.*need media_diagnostic/);
 const privatePrompt = slackDiagnosticsPrompt({ newestMessage: "Check this <@U123456789> person@example.com from 8.8.8.8", reporter: "Secret Viewer" });
 assert.doesNotMatch(privatePrompt, /U123456789|person@example\.com|8\.8\.8\.8|Secret Viewer/);
+const scopedPrompt = slackDiagnosticsPrompt({ request: { mediaTitle: "The Great Escape", year: 2018, seasons: [5] } });
+assert.match(scopedPrompt, /"year":2018/);
+assert.match(scopedPrompt, /"seasonNumber":5/);
+assert.match(scopedPrompt, /internal media selectors.*allowed for subsequent read-only tool calls/);
+assert.match(scopedPrompt, /Keep internal selectors out of the analysis/);
+assert.match(scopedPrompt, /truncated result is incomplete evidence/);
+
+const unavailableEvents = [];
+const publicOnly = await runCodexSlackDiagnostics(config, {}, settings, {
+  listTools: async () => { throw new Error("PRIVATE upstream URL and credentials"); },
+  onEvent: event => unavailableEvents.push(event),
+  runModel: async () => JSON.stringify({ analysis: "The media lookup is unavailable.", sources: [], completion: "partial" })
+});
+assert.equal(publicOnly.completion, "partial");
+assert.equal(unavailableEvents.find(event => event.type === "slack_readonly_catalog").status, "unavailable");
+assert.doesNotMatch(JSON.stringify(unavailableEvents), /PRIVATE|credentials/);
 
 const started = Date.now();
 const timedOut = await runCodexSlackDiagnostics(config, {}, settings, { timeoutMs: 25, listTools: async () => [], runModel: async () => new Promise(() => {}) });
@@ -195,4 +273,56 @@ try {
   assert.equal(mixed.usage.webCalls, 3);
 
 } finally { await rm(root, { recursive: true, force: true }); }
+
+const telemetryRoot = await mkdtemp(path.join(os.tmpdir(), "slack-research-telemetry-"));
+try {
+  const records = [];
+  const telemetryConfig = { dbPath: path.join(telemetryRoot, "state.sqlite"), logPath: path.join(telemetryRoot, "agent.log"), codexHome: await createCodexHome(telemetryRoot), suppressInitLog: true };
+  const agent = new MediaIssueAgent(telemetryConfig, {}, {
+    slackDiagnosticRunner: async (_config, _context, _settings, hooks) => {
+      hooks.onEvent({ type: "slack_readonly_catalog", status: "ok", toolCount: 82, durationMs: 11 });
+      hooks.onEvent({ type: "slack_readonly_tool_completed", toolName: "media_public_recent_additions", status: "unavailable", callCount: 1, outputBytes: 54, durationMs: 122,
+        arguments: { ratingKey: "PRIVATE" }, result: { token: "PRIVATE" }, error: "PRIVATE upstream URL" });
+      return { completion: "partial", analysis: "Recent additions could not be checked.", facts: [] };
+    },
+    slackReplyRunner: async () => "Recent additions could not be checked."
+  });
+  await agent.init();
+  agent.diagnostic = (level, event, details) => records.push({ level, event, details });
+  await agent.slackReadOnlyChat({ newestMessage: "Recently added shows?" });
+  const record = records.find(record => record.event === "slack_readonly_tool_completed");
+  assert.equal(record.level, "warn");
+  assert.deepEqual(record.details, { toolName: "media_public_recent_additions", status: "unavailable", callCount: 1, durationMs: 122, outputBytes: 54 });
+  assert.doesNotMatch(JSON.stringify(records), /PRIVATE|ratingKey|token|arguments|result|upstream/);
+
+  const aggregateCalls = [];
+  const aggregateAgent = new MediaIssueAgent(telemetryConfig, {
+    listTools: async () => tools,
+    callTool: async (name, args) => {
+      aggregateCalls.push({ name, args });
+      return { available: true, complete: true, period: args.periodDays ? "lookback" : "all_time", ...args, scope: args.title ? "title" : "library", matched: true, playCount: 24000, totalWatchSeconds: 86400 };
+    }
+  }, {
+    slackDiagnosticRunner: (actualConfig, context, settings, hooks) => runCodexSlackDiagnostics(actualConfig, context, settings, {
+      ...hooks,
+      runModel: async (_config, prompt, options) => {
+        assert.match(prompt, /researchComplexity is only a preliminary chat-classifier hint/);
+        assert.match(prompt, /excessive/);
+        const result = await rpc(options, "tools/call", { name: "media_public_watchtime_summary", arguments: { allTime: true } });
+        assert.equal(JSON.parse(result.result.content[0].text).complete, true);
+        return JSON.stringify({ analysis: "24 hours across all recorded history.", sources: [], completion: "complete" });
+      }
+    }),
+    slackReplyRunner: async (_config, _context, evidence) => evidence.analysis
+  });
+  const aggregateAnswer = await aggregateAgent.slackReadOnlyChat({ newestMessage: "How many years/months/days have been watched in total?", request: { queryType: "watchtime_summary", allTime: true, researchComplexity: "excessive" } });
+  assert.match(aggregateAnswer.message, /24 hours across all recorded history/);
+  assert.deepEqual(aggregateCalls, [{ name: "media_public_watchtime_summary", args: { allTime: true } }], "a low-model cost hint cannot reject an inexpensive all-library aggregate");
+  for (const timeframe of [{ allTime: true }, { periodDays: 1826 }, { periodYears: 5 }, {}]) {
+    const answer = await aggregateAgent.slackMediaInfo({ queryType: "watchtime_summary", mediaTitle: "Example Show", ...timeframe });
+    assert.deepEqual(aggregateCalls.at(-1).args, { title: "Example Show", ...timeframe });
+    assert.doesNotMatch(answer.message, /last (?:30|365) days/);
+    assert.match(answer.message, timeframe.periodDays ? /last 1,826 days/ : /all recorded history/);
+  }
+} finally { await rm(telemetryRoot, { recursive: true, force: true }); }
 console.log("Slack general research and budget tests passed");

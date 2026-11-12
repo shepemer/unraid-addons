@@ -153,6 +153,38 @@ for (const toolName of ["<@PRIVATE>", "media.plex_get_metadata <@PRIVATE>", "con
 assert.match(render(details([call(1, "constructor_secret")])), /Media service operation/);
 assert.match(render(details([call(1, "seerr_public_search_media")])), /Seerr media catalog lookup/);
 assert.match(render(details([call(1, "sonarr_update_quality_profile")])), /Sonarr service update request/);
+// New capabilities describe the recorded check/request without disclosing its
+// exact target, implying success, or treating a status read as a new mutation.
+for (const [name, label] of [
+  ["sonarr_series_missing_episodes", "Sonarr missing episode check"],
+  ["sonarr_missing_episode_candidate_matrix", "Sonarr episode candidate check"],
+  ["prowlarr_search_tv_episode_exact", "Prowlarr release search request"],
+  ["radarr_blocklist_movie_file_source", "Radarr source suppression request"],
+  ["radarr_blocklist_movie_source", "Radarr source suppression request"],
+  ["qbittorrent_import_prowlarr_torrent", "qBittorrent torrent metadata handoff request"],
+  ["qbittorrent_url_job_status", "qBittorrent torrent handoff status check"],
+  ["qbittorrent_cancel_url_job", "qBittorrent torrent handoff cancellation request"],
+  ["media_wait_for_download_import", "Media download import status check"],
+  ["media_path_map_status", "Media path mapping check"],
+  ["media_list_series_files", "Media series file inspection"],
+  ["media_probe_decode_interval", "Media file decode check"],
+  ["media_verify_subtitle_sync", "Media subtitle timing comparison"],
+  ["media_retime_subtitle_sidecar", "Media subtitle timing adjustment request"],
+  ["media_remux_compatibility_copy", "Media compatibility copy request"],
+  ["plex_playback_attempt_diagnostics", "Plex playback evidence check"],
+  ["plex_issue_session_correlation", "Plex playback evidence check"],
+  ["plex_transcode_session_diagnostics", "Plex transcode evidence check"],
+  ["plex_test_playback", "Plex playback decision check"],
+  ["plex_set_stream_preferences", "Plex stream preference update request"],
+  ["plex_set_default_stream_or_mkv_track_flags", "Plex stream preference update request"],
+  ["plex_scan_status", "Plex library scan status check"]
+]) {
+  const startedMessage = render(details([call(1, `mcp__media__${name}`)]));
+  assert.ok(startedMessage.includes(`Current recorded step: ${label}`), name);
+  const returnedMessage = render(details([call(1, name), result(2, name, [{ viewer: "PRIVATE PERSON", file: "/private/path", result: "SECRET" }])]));
+  assert.ok(returnedMessage.includes(`Recent calls returned: ${label}`), name);
+  assert.doesNotMatch(startedMessage + returnedMessage, /PRIVATE|SECRET|private\/path|Verification: passed|playback is working/);
+}
 const blocked = render(details([call(1, "seerr_resolve_issue"), event(2, "repair_mcp_proxy_blocked", { toolName: "seerr_resolve_issue", message: "PRIVATE" })]));
 assert.match(blocked, /requires separate final approval/);
 assert.doesNotMatch(blocked, /Current recorded step|PRIVATE/);

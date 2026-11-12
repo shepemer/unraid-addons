@@ -26,6 +26,7 @@ import {
   slackMessagesForThread,
   slackModerationStatus,
   slackQueueStatus,
+  slackOutboxIsSending,
   slackThreadForMessage,
   updateSlackReporterIdentity
 } from "./db.js";
@@ -47,6 +48,7 @@ import {
 } from "./moderation.js";
 import { redactText } from "./redact.js";
 import { pushoverConfigured, sendSlackPushoverMessage } from "./pushover.js";
+import { publicResearchTimeframe } from "./slack-readonly.js";
 
 export const SLACK_LIMITS = Object.freeze({
   userInteractionsPerTenMinutes: 180,
@@ -218,6 +220,11 @@ function stripSlackMentions(value) {
 
 export function parseSlackIssueControl(value) {
   const message = stripSlackMentions(value).trim();
+  const stopLines = stripSlackMentionTokens(value).toLowerCase().split(/\r?\n/).map(line => line.trim().replace(/[.!?]+$/, ""));
+  if (stopLines.some(line => /^(?:no[, ]+)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:stop|cancel|pause)(?:\s+(?:the|this|your))?\s+investigat(?:ion|ing)(?:\s+(?:this|it|(?:this|the)\s+(?:issue|ticket|report)))?(?:\s+(?:please|now|for now))?$/.test(line)
+    || /^(?:please\s+)?(?:do not|don't|don’t)\s+(?:re[- ]?investigate|investigate)(?:\s+(?:again|this|it))?(?:\s+please)?$/.test(line))) {
+    return { action: "stop_investigation", message };
+  }
   const text = message.toLowerCase().replace(/^please\s+/, "").replace(/[.!]+$/, "").trim();
   if (/^(?:i\s+)?(?:approve|authorize)(?:\s+the)?\s+(?:repair|fix)(?:\s+plan)?$/.test(text)
     || /^(?:complete|do|run|execute|start)(?:\s+the)?\s+(?:repair|fix)$/.test(text)) {
@@ -230,7 +237,7 @@ export function parseSlackIssueControl(value) {
   if (/^retry(?:\s+the)?\s+repair$/.test(text)) {
     return { action: "retry_repair", message };
   }
-  if (/^(?:re[ -]?investigate|investigate again|check again|take another look)(?:$|[,:.]|\s+(?:please|and|with|using|the|this|it|because)\b)/.test(text)) {
+  if (/^(?:re[ -]?investigate|investigate again|resume (?:the )?investigation|check again|take another look)(?:$|[,:.]|\s+(?:please|and|with|using|the|this|it|because)\b)/.test(text)) {
     return { action: "reinvestigate", message };
   }
   if (/^(?:steer|investigation instructions?|repair instructions?)\s*[:,-]\s*\S/.test(text)) {
@@ -247,6 +254,18 @@ function isSlackIssueStatusQuestion(value) {
     || /^what(?: specifically| exactly)? (?:is (?:it|the repair|the investigation)|are you) (?:doing|working on)(?: (?:right )?now)?$/.test(text)
     || /^what (?:has (?:it|the repair|the investigation)|have you) (?:done|completed)(?: so far)?$/.test(text)
     || /^what has been (?:done|completed)(?: so far)?$/.test(text);
+}
+
+function isSlackInformationalFollowup(value) {
+  const text = stripSlackMentions(value).toLowerCase();
+  return /\?$/.test(text) || /^(?:what|who|when|where|why|how|is|are|can|could|do|does|did|has|have|will|would)\b/.test(text)
+    || /\bwatch[ -]?time\b|\b(?:total|how many)\s+(?:hours|minutes|plays|views)\b/.test(text);
+}
+
+function isSlackCasualDesire(value) {
+  const text = stripSlackMentions(value).toLowerCase();
+  return /\b(?:we|i|they)\s+(?:really\s+)?(?:wanna|want to|would love to|can['’]t wait to)\s+watch\b|\b(?:about to start|starts? soon|coming soon)\b/.test(text)
+    && !/\b(?:error|fails?|failing|failed|missing|broken|not (?:playing|working|downloading)|won['’]t (?:play|download))\b/.test(text);
 }
 
 function asksForIssueExplanation(value) {
@@ -329,11 +348,6 @@ function normalizedSeasons(value) {
     .slice(0, 50);
 }
 
-function normalizedWatchtimePeriodDays(value) {
-  const days = Number(value);
-  return Number.isInteger(days) && days >= 1 && days <= 366 ? days : 30;
-}
-
 function normalizedMediaRequestCount(value) {
   const count = Number(value);
   return Number.isInteger(count) && count >= 1
@@ -400,12 +414,19 @@ export function parseSlackIntentResult(output) {
   if (parsed.shouldRespond !== undefined && typeof parsed.shouldRespond !== "boolean") {
     throw new Error("Slack intent classifier shouldRespond must be a boolean.");
   }
+  for (const field of ["hasNewIssueEvidence", "explicitIssueControl"]) {
+    if (parsed[field] !== undefined && typeof parsed[field] !== "boolean") {
+      throw new Error(`Slack intent classifier ${field} must be a boolean.`);
+    }
+  }
   const queryType = MEDIA_QUERY_TYPES.has(String(parsed.queryType || ""))
     ? String(parsed.queryType)
     : "";
   const result = {
     intent,
     confidence,
+    hasNewIssueEvidence: parsed.hasNewIssueEvidence === true,
+    explicitIssueControl: parsed.explicitIssueControl === true,
     ...(parsed.shouldRespond !== undefined ? { shouldRespond: parsed.shouldRespond } : {}),
     ...(parsed.researchComplexity === "excessive" ? { researchComplexity: "excessive" } : {}),
     ...(intent === "issue_control" ? { issueAction: ["steer", "reinvestigate"].includes(parsed.issueAction) ? parsed.issueAction : "steer" } : {}),
@@ -417,9 +438,7 @@ export function parseSlackIntentResult(output) {
     seasons: normalizedSeasons(parsed.seasons),
     allSeasons: parsed.allSeasons === true,
     queryType,
-    ...(queryType === "watchtime_summary"
-      ? { periodDays: normalizedWatchtimePeriodDays(parsed.periodDays) }
-      : {}),
+    ...(["media_info", "media_diagnostic"].includes(intent) ? publicResearchTimeframe(parsed) : {}),
     service: MEDIA_SERVICES.has(String(parsed.service || "").toLowerCase())
       ? String(parsed.service).toLowerCase()
       : "",
@@ -1476,6 +1495,7 @@ export class SlackService {
         safeMessage = `${formatSlackMessage(safeMessage, 3500 - mentions.length - 2)}\n\n${mentions}`;
       }
     }
+    if (options.shouldEnqueue && !options.shouldEnqueue()) return null;
     return enqueueSlackOutbox(this.dbPath, {
       slackIssueId: item.slackIssueId || null,
       threadId: item.threadId,
@@ -1671,6 +1691,20 @@ export class SlackService {
       return;
     }
 
+    if (item.slackIssueId && ["issue_followup", "issue_report", "issue_control"].includes(result.intent)) {
+      const informal = isSlackCasualDesire(item.text);
+      const informational = isSlackInformationalFollowup(item.text);
+      const explicitControl = result.intent === "issue_control" && result.explicitIssueControl === true;
+      if (informal || (!explicitControl && informational)) {
+        if (informal && !participation.explicitMention && participation.channelKind !== "dm") return;
+        result = { ...result, intent: informational && !informal ? "media_diagnostic" : "conversation" };
+      } else if ((result.intent === "issue_control" && !explicitControl)
+        || (["issue_report", "issue_followup"].includes(result.intent) && result.hasNewIssueEvidence !== true)) {
+        if (!participation.explicitMention && participation.channelKind !== "dm") return;
+        result = { ...result, intent: "conversation" };
+      }
+    }
+
     if (item.slackIssueId && result.intent === "issue_status") {
       if (asksForIssueExplanation(item.text)) {
         await this.replyWithReadOnlyChat(item, result, context);
@@ -1815,7 +1849,7 @@ export class SlackService {
         "issue_followup",
         `issue-followup:${item.eventId}`,
         personalityResponse(
-          `I added this information to Slack issue #${issue.id}. I’ll check it and post updated findings here before any repair approval.`,
+          `I added this information to Slack issue #${issue.id}. The owner can reply ‘re-investigate’ to check it; this message does not start work or reopen the issue.`,
           result.socialTone
         )
       );
@@ -1893,6 +1927,7 @@ export class SlackService {
         await wait(delay);
       }
       try {
+        if (!slackOutboxIsSending(this.dbPath, item.id)) continue;
         const result = await this.transport.postMessage(item);
         this.lastChannelSendAt.set(item.channelId, Date.now());
         completeSlackOutbox(this.dbPath, item.id, result);
@@ -1983,6 +2018,7 @@ export class SlackService {
       if (!item) {
         break;
       }
+      if (!slackOutboxIsSending(this.dbPath, item.id)) continue;
       const result = await this.transport.postMessage(item);
       completeSlackOutbox(this.dbPath, item.id, result);
       sent += 1;
