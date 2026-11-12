@@ -144,6 +144,55 @@ function compact(value, maxLength) {
   return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
+function slackParticipation(item, botUserId, channelId) {
+  const text = String(item.text || "");
+  const mentions = [...text.matchAll(/<@([^>|]+)(?:\|[^>]+)?>/g)].map(match => match[1]);
+  const leadingMention = text.match(/^\s*(?:(?:hey|hi|hello|thanks|thank you)[\s,]+)?<@([^>|]+)(?:\|[^>]+)?>/i)?.[1];
+  return {
+    explicitMention: item.eventType === "app_mention" || Boolean(botUserId && mentions.includes(botUserId)),
+    channelKind: item.channelId === channelId ? "channel" : "dm",
+    mentionsOtherUsers: mentions.some(userId => userId !== botUserId),
+    addressesOtherUser: Boolean(leadingMention && leadingMention !== botUserId)
+  };
+}
+
+function obviousSlackSocialMessage(value) {
+  const text = stripSlackMentions(value)
+    .replace(/:[a-z0-9_+\-]+:/gi, " ")
+    .replace(/[^\p{L}\p{N}'’\s]/gu, " ")
+    .replace(/\s+/g, " ").trim().toLowerCase();
+  if (!text) return true; // Emoji, reaction, punctuation, or a human mention alone.
+  return /^(?:(?:thanks?|thank you|thx|ty)(?: so much| a lot| again)?|(?:thanks?|thank you|thx|ty) [\p{L}'’]+ (?:lol|lmao|haha+)|lol+|lmao+|rofl|(?:ha){2,}|bruh|uh oh|oh no|no not you|not you|i (?:wasn't|wasn’t|was not) talking to you)$/u.test(text);
+}
+
+function formatSlackMessage(value, maxLength = 3500) {
+  const text = String(value || "")
+    // Models sometimes return Markdown bold; Slack uses a single asterisk.
+    // Preserve code spans/fences and leave ambiguous runs of stars alone.
+    .replace(/(```[\s\S]*?(?:```|$)|`[^`\n]*(?:`|$))|(?<![\\*])\*\*([^\s*](?:[^*\n]*[^\s*])?)\*\*(?!\*)/g,
+      (match, code, bold) => code || `*${bold}*`)
+    .replace(/\r\n?|\u2028|\u2029/g, "\n")
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/ +\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  const limit = Math.max(0, Math.floor(maxLength));
+  if (text.length <= limit) return text;
+  if (limit < 3) return ".".repeat(limit);
+  let prefix = text.slice(0, limit - 3).trimEnd();
+  // Do not split a UTF-16 character or leave a partial Slack link/mention.
+  if (/[\uD800-\uDBFF]$/.test(prefix)) prefix = prefix.slice(0, -1);
+  if (prefix.lastIndexOf("<") > prefix.lastIndexOf(">")) prefix = prefix.slice(0, prefix.lastIndexOf("<")).trimEnd();
+  return `${prefix}...`;
+}
+
+function stripSlackMentionTokens(value) {
+  return String(value || "")
+    .replace(/<@[A-Z0-9]+>/gi, " ")
+    .replace(/<#[A-Z0-9]+(?:\|[^>]*)?>/gi, " ")
+    .replace(/<![^>]+>/g, " ");
+}
+
 function formatSlackWait(value) {
   let remaining = Math.max(1, Math.ceil(Number(value) || 1));
   const parts = [];
@@ -164,12 +213,7 @@ function formatSlackWait(value) {
 }
 
 function stripSlackMentions(value) {
-  return String(value || "")
-    .replace(/<@[A-Z0-9]+>/gi, " ")
-    .replace(/<#[A-Z0-9]+(?:\|[^>]*)?>/gi, " ")
-    .replace(/<![^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return stripSlackMentionTokens(value).replace(/\s+/g, " ").trim();
 }
 
 export function parseSlackIssueControl(value) {
@@ -196,10 +240,13 @@ export function parseSlackIssueControl(value) {
 }
 
 function isSlackIssueStatusQuestion(value) {
-  const text = stripSlackMentions(value).toLowerCase().replace(/[.!?]+$/, "").trim();
+  const text = stripSlackMentions(value).toLowerCase().replace(/[’‘]/g, "'").replace(/[.!?]+$/, "").trim();
   // Only short workflow questions bypass classification. A leading "status"
   // must not swallow a research question about another subject in this thread.
-  return /^(?:what(?:'s| is)(?: the)? status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|(?:any|an) updates?(?: (?:on|about|for) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|how(?:'s| is) (?:it|(?:the |this |my |our )?(?:repair|investigation)) going)$/.test(text);
+  return /^(?:what(?:'s| is)(?: the)? status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|(?:any|an) updates?(?: (?:on|about|for) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|how(?:'?s| is) (?:it|(?:the |this |my |our )?(?:repair|investigation)) going(?: so far)?)$/.test(text)
+    || /^what(?: specifically| exactly)? (?:is (?:it|the repair|the investigation)|are you) (?:doing|working on)(?: (?:right )?now)?$/.test(text)
+    || /^what (?:has (?:it|the repair|the investigation)|have you) (?:done|completed)(?: so far)?$/.test(text)
+    || /^what has been (?:done|completed)(?: so far)?$/.test(text);
 }
 
 function asksForIssueExplanation(value) {
@@ -243,7 +290,7 @@ function parseJsonObject(output) {
 }
 
 function safeClassifierReply(value) {
-  const text = compact(redactText(stripSlackMentions(value)), SLACK_RESPONSE_MAX_CHARACTERS);
+  const text = formatSlackMessage(redactText(stripSlackMentionTokens(value)), SLACK_RESPONSE_MAX_CHARACTERS);
   if (!text || /\[REDACTED(?:_[A-Z]+)?\]/.test(text)) {
     return "";
   }
@@ -350,12 +397,16 @@ export function parseSlackIntentResult(output) {
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     throw new Error("Slack intent classifier confidence must be between 0 and 1.");
   }
+  if (parsed.shouldRespond !== undefined && typeof parsed.shouldRespond !== "boolean") {
+    throw new Error("Slack intent classifier shouldRespond must be a boolean.");
+  }
   const queryType = MEDIA_QUERY_TYPES.has(String(parsed.queryType || ""))
     ? String(parsed.queryType)
     : "";
   const result = {
     intent,
     confidence,
+    ...(parsed.shouldRespond !== undefined ? { shouldRespond: parsed.shouldRespond } : {}),
     ...(parsed.researchComplexity === "excessive" ? { researchComplexity: "excessive" } : {}),
     ...(intent === "issue_control" ? { issueAction: ["steer", "reinvestigate"].includes(parsed.issueAction) ? parsed.issueAction : "steer" } : {}),
     mediaTitle: compact(redactText(stripSlackMentions(parsed.mediaTitle)), 160),
@@ -867,6 +918,9 @@ export class SlackSocketTransport {
       text: item.message,
       client_msg_id: slackClientMessageId(item.dedupeKey),
       ...(item.threadTs ? { thread_ts: item.threadTs } : {}),
+      mrkdwn: true,
+      parse: "none",
+      link_names: false,
       unfurl_links: false,
       unfurl_media: false
     });
@@ -906,7 +960,7 @@ export function queueSlackIssueMessage(dbPath, issueId, kind, dedupeKey, message
     dedupeKey,
     channelId: issue.channelId,
     threadTs: options.threaded === false ? null : issue.rootTs,
-    message: compact(message, 3500)
+    message: formatSlackMessage(message, 3500)
   });
 }
 
@@ -1047,6 +1101,11 @@ export class SlackService {
         this.dbPath, teamId, String(event.channel), rootTs
       );
       if (!tracked) {
+        return null;
+      }
+      // Obvious channel chatter needs neither moderation nor a classifier or
+      // rate-limit notice. Keep meaningful follow-ups and selections queued.
+      if (obviousSlackSocialMessage(event.text)) {
         return null;
       }
     }
@@ -1357,7 +1416,7 @@ export class SlackService {
 
   async enqueueThreadReply(item, kind, dedupeKey, message, options = {}) {
     const notifyOwners = options.notifyOwners === true || Array.isArray(options.mentionOwnerIds);
-    let safeMessage = compact(notifyOwners ? stripSlackMentions(message) : message, 3500);
+    let safeMessage = formatSlackMessage(notifyOwners ? stripSlackMentionTokens(message) : message, 3500);
     if (!options.trustedTemplate) {
       const contentDigest = keyedSlackContentDigest(safeMessage, this.pendingEncryptionKey);
       const localCategory = highConfidenceSlackSafetyCategory(safeMessage);
@@ -1405,9 +1464,16 @@ export class SlackService {
       // text. Append them only after the public body has passed moderation.
       const requested = options.notifyOwners === true ? null : options.mentionOwnerIds;
       const recipients = this.ownerUserIds().filter(id => !requested || requested.includes(id));
-      const mentions = recipients.map(id => `<@${id}>`).join(" ");
+      // Keep recipient tokens intact and reserve space for the public body even
+      // if an unusually large owner list was configured.
+      const footerLimit = 3500 - Math.min(100, safeMessage.length) - 2;
+      let mentions = "";
+      for (const id of recipients) {
+        const next = `${mentions ? `${mentions} ` : ""}<@${id}>`;
+        if (next.length <= footerLimit) mentions = next;
+      }
       if (mentions) {
-        safeMessage = `${compact(safeMessage, 3500 - mentions.length - 1)} ${mentions}`;
+        safeMessage = `${formatSlackMessage(safeMessage, 3500 - mentions.length - 2)}\n\n${mentions}`;
       }
     }
     return enqueueSlackOutbox(this.dbPath, {
@@ -1422,6 +1488,11 @@ export class SlackService {
   }
 
   async processInbound(item) {
+    let participation = slackParticipation(item, this.botUserId, this.config.slackChannelId);
+    if (!item.pendingCiphertext && participation.channelKind === "channel"
+      && !participation.explicitMention && obviousSlackSocialMessage(item.text)) {
+      return;
+    }
     if (
       item.slackIssueId
       && item.threadKind === "issue"
@@ -1458,12 +1529,21 @@ export class SlackService {
     if (!await this.ensureInboundModerated(item)) {
       return;
     }
-    const control = item.slackIssueId ? parseSlackIssueControl(item.text) : null;
+    // Pending text becomes readable only after moderation. Read addressing
+    // signals before stripping Slack mentions from model-visible context.
+    participation = slackParticipation(item, this.botUserId, this.config.slackChannelId);
+    if (participation.channelKind === "channel" && !participation.explicitMention
+      && obviousSlackSocialMessage(item.text)) {
+      return;
+    }
+    const directedToBot = participation.explicitMention || participation.channelKind === "dm";
+    const allowShortcut = directedToBot || !participation.addressesOtherUser;
+    const control = item.slackIssueId && allowShortcut ? parseSlackIssueControl(item.text) : null;
     if (control) {
       await this.handleIssueControl(item, control);
       return;
     }
-    if (item.slackIssueId && isSlackIssueStatusQuestion(item.text)) {
+    if (item.slackIssueId && allowShortcut && isSlackIssueStatusQuestion(item.text)) {
       await this.replyWithIssueStatus(item);
       return;
     }
@@ -1475,12 +1555,12 @@ export class SlackService {
       .map(message => ({
         direction: message.direction,
         user: message.direction === "inbound" ? "human" : "bot",
-        text: compact(stripSlackMentions(message.text), 4000)
+        text: formatSlackMessage(stripSlackMentionTokens(message.text), 4000)
       }));
     const context = {
       trackedIssue: Boolean(item.slackIssueId),
       threadKind: item.threadKind,
-      channelKind: item.channelId === this.config.slackChannelId ? "channel" : "dm",
+      ...participation,
       recentMessages,
       newestMessage: compact(stripSlackMentions(item.text), 4000)
     };
@@ -1541,10 +1621,8 @@ export class SlackService {
         { trustedTemplate: true });
       return;
     }
-    // Send durable progress before starting work; the outbound worker runs
-    // independently while Codex or the existing approval workflow is active.
-    await this.enqueueThreadReply(item, "issue_control_started", `issue-control-started:${item.eventId}`,
-      "I’m checking the current issue state and your instructions. I’ll post the result here.", { trustedTemplate: true });
+    // The controller returns its acknowledgement after scheduling background
+    // work. Use that one response instead of a second preliminary message.
     const answer = await this.agent.handleSlackIssueControl(item.slackIssueId, {
       ...control,
       userId: item.userId,
@@ -1574,6 +1652,12 @@ export class SlackService {
   }
 
   async applyIntent(item, result, context = {}) {
+    const participation = slackParticipation(item, this.botUserId, this.config.slackChannelId);
+    if (participation.channelKind === "channel" && !participation.explicitMention
+      && (result.shouldRespond === false || (result.shouldRespond !== true
+        && ["conversation", "unsupported", "needs_clarification"].includes(result.intent)))) {
+      return;
+    }
     if (result.socialTone === "exploit_attempt") {
       if (!item.slackIssueId) {
         setSlackThreadKind(this.dbPath, item.threadId, "conversation", "closed");

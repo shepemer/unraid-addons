@@ -6332,15 +6332,21 @@ async function mediaPublicTitleSummary({ title, mediaType, year }) {
 }
 
 function publicDurationSeconds(value) {
-  if (value === undefined || value === null || String(value).trim() === "") {
+  if (typeof value !== "number" && typeof value !== "string") {
     return null;
   }
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && numeric >= 0) {
-    return Math.floor(numeric);
-  }
-  const text = String(value || "").trim().toLowerCase();
+  const text = String(value).trim().toLowerCase();
   if (!text) {
+    return null;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const seconds = Math.floor(Number(text));
+    return Number.isSafeInteger(seconds) ? seconds : null;
+  }
+  // Tautulli formats totals as whole duration components. Reject any extra
+  // text, negative sign or unknown unit instead of accepting a partial match.
+  const component = "\\d+(?:\\.\\d+)?\\s*(?:days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)";
+  if (!new RegExp(`^${component}(?:\\s+${component})*$`).test(text)) {
     return null;
   }
   const sizes = {
@@ -6359,13 +6365,11 @@ function publicDurationSeconds(value) {
     second: 1,
     seconds: 1
   };
-  let matched = false;
   let seconds = 0;
-  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(days?|hrs?|hours?|mins?|minutes?|secs?|seconds?)/g)) {
-    matched = true;
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?)/g)) {
     seconds += Number(match[1]) * sizes[match[2]];
   }
-  return matched ? Math.floor(seconds) : null;
+  return Number.isSafeInteger(Math.floor(seconds)) ? Math.floor(seconds) : null;
 }
 
 function tautulliPublicHistoryMediaType(row) {
@@ -6417,7 +6421,11 @@ async function tautulliPublicHistoryTotals(input, periodStartDate) {
       query: { ...query, start: 0, length: 1 }
     });
     const playCount = Number(summary?.recordsFiltered);
-    const totalWatchSeconds = publicDurationSeconds(summary?.filter_duration);
+    // get_history's filter_duration sums only the returned page (length=1).
+    // total_duration applies the same date/media-type custom_where across all
+    // matching history. Search text is not part of that total, so exact-title
+    // queries must continue through the bounded row-filtering path below.
+    const totalWatchSeconds = publicDurationSeconds(summary?.total_duration);
     if (Number.isFinite(playCount) && playCount >= 0 && totalWatchSeconds !== null) {
       return {
         playCount: Math.floor(playCount),

@@ -5,7 +5,7 @@ import path from "node:path";
 import { MediaIssueAgent } from "../src/agent.js";
 import {
   archiveSlackInbound, claimSlackInbound, completeSlackInbound, createSlackIssue,
-  createAgentRun, recoverInterruptedAgentRuns,
+  createAgentRun, completeAgentRun, recoverInterruptedAgentRuns, recordAudit,
   ensureJob, getSetting, insertSnapshot, jobForId, listSlackIssueRecords,
   pendingApprovalForJobAnyKind, recoverSlackInvestigations, slackIssueForId,
   transitionJob, transitionJobAndCreateApproval, transitionJobAndResolveApproval,
@@ -60,11 +60,13 @@ try {
   assert.equal(posts.length, 1);
   assert.equal(posts[0][0].rootTs, "100");
   assert.equal(posts[0][4].notifyOwners, true);
-  assert.match(posts[0][3], /five missing episodes/);
+  assert.match(posts[0][3], /^\*Investigation complete\*\n\n\*Findings\*\n• Missing episodes/);
+  assert.match(posts[0][3], /\n\n\*Proposed work\*\n• Inspect monitoring\n• Verify result/);
+  assert.ok(posts[0][3].length < 1000, "the investigation handoff stays concise");
+  assert.doesNotMatch(posts[0][3], /Current read-only checks|\.\./);
   assert.match(posts[0][3], /approve repair/);
   assert.doesNotMatch(posts[0][3], /PRIVATE|private\/path/);
-  assert.equal(diagnosticContexts[0].issue.mediaTitle, "The Great Escape");
-  assert.match(diagnosticContexts[0].issue.description, /Season 5/);
+  assert.equal(diagnosticContexts.length, 0, "publishing a completed investigation must not start a second research run");
   agent.scheduleSlackInvestigations();
   await agent.slackInvestigationPromise;
   assert.equal(posts.length, 1, "polls must not repeat owner notifications");
@@ -116,8 +118,53 @@ try {
   await agent.publishSlackResolution(job.id);
   assert.equal(posts.length, 2, "final review notifications are also deduplicated");
 
+  // The failure producer and the Slack command worker must converge on one
+  // explanation, even while asynchronous outbound moderation is in flight.
+  const beforeFailure = posts.length;
+  const failedRun = createAgentRun(config.dbPath, job.id, "repair", "fixture", {});
+  completeAgentRun(config.dbPath, failedRun.id, "failed_retryable", null, "Sonarr request timed out");
+  agent.startSlackControlWork(job.id, async () => agent.recordRepairFailureForOperatorReview(
+    job.id, "fixture", "Sonarr request timed out", { agentRunId: failedRun.id,
+      repairResult: { status: "failed_retryable", summary: "Sonarr request timed out", actionsTaken: [], verification: { status: "failed" } } }
+  ));
+  await agent.slackControlRuns.get(job.id);
+  await agent.publishSlackRepairFailure(job.id);
+  agent.scheduleSlackInvestigations();
+  await agent.slackInvestigationPromise;
+  assert.equal(posts.length, beforeFailure + 1, "one failure notification across producer, worker, and poll");
+  assert.equal(posts.at(-1)[1], "repair_needs_review");
+  assert.equal(posts.at(-1)[4].notifyOwners, true);
+  assert.match(posts.at(-1)[3], /timed out|time limit/i);
+  assert.match(posts.at(-1)[3], /retry repair/);
+  assert.doesNotMatch(posts.at(-1)[3], /owner_control_completed|PRIVATE|private\/path/);
+
+  // A retry can fail during preparation, before a new run row exists. It still
+  // needs a new notification, not the old run's deduplication key.
+  agent.recordRepairFailureForOperatorReview(job.id, "fixture", "Media service unavailable");
+  await agent.publishSlackRepairFailure(job.id);
+  assert.equal(posts.length, beforeFailure + 2);
+  assert.match(posts.at(-1)[3], /could not be reached/i);
+  await agent.publishSlackRepairFailure(job.id);
+  assert.equal(posts.length, beforeFailure + 2);
+
+  // Steering and re-investigation already acknowledge that work was queued.
+  // Their automatic worker must not emit a second generic checking response.
+  const startCount = () => sqliteExec(config.dbPath, "SELECT COUNT(*) AS count FROM slack_outbox WHERE kind = 'investigation_started';", { json: true })[0].count;
+  const starts = startCount();
+  for (const action of ["steer", "reinvestigate"]) {
+    const acknowledgment = await agent.handleSlackIssueControl(issue.id, {
+      action, message: action === "steer" ? "Check only the affected season" : "re-investigate",
+      userId: "UOWNER", eventId: `ack-${action}`, threadId: issue.threadId
+    });
+    assert.match(acknowledgment.message, /queued.*investigation/);
+    agent.scheduleSlackInvestigations();
+    await agent.slackInvestigationPromise;
+    assert.equal(startCount(), starts, "one acknowledgment before findings");
+    assert.equal(getSetting(config.dbPath, `slack-investigation-announced:${job.id}`, false), false);
+  }
+
   // A crash during read-only investigation is recoverable; approvals stay gated.
-  transitionJob(config.dbPath, job.id, ["awaiting_resolution_approval"], "investigating");
+  transitionJob(config.dbPath, job.id, ["awaiting_action_approval"], "investigating");
   recoverSlackInvestigations(config.dbPath);
   assert.equal(jobForId(config.dbPath, job.id).state, "queued_for_investigation");
 
@@ -139,6 +186,64 @@ try {
   sqliteExec(config.dbPath, `UPDATE agent_runs SET owner_pid = 999999 WHERE id = ${run.id};`);
   assert.equal(recoverInterruptedAgentRuns(config.dbPath), 1, "fresh dead-process runs must recover immediately");
   assert.equal(jobForId(config.dbPath, interrupted.id).state, "failed_retryable");
+
+  // Recovery has no producer process left to publish. Polling must announce a
+  // first interrupted repair even though no previousRepairFailure was saved.
+  const recoveryInbound = archiveSlackInbound(config.dbPath, event("event6", "600", "Season missing"));
+  completeSlackInbound(config.dbPath, "event6");
+  const recoveryIssue = createSlackIssue(config.dbPath, recoveryInbound.threadId, { mediaTitle: "Recovery fixture", description: "Season missing", confidence: 1 });
+  const recoveryJob = ensureJob(config.dbPath, "slack", String(recoveryIssue.id));
+  upsertInvestigation(config.dbPath, recoveryJob.id, { status: "ready", summary: "Missing episodes", evidence: {} });
+  transitionJob(config.dbPath, recoveryJob.id, ["detected"], "executing");
+  const firstInterrupted = createAgentRun(config.dbPath, recoveryJob.id, "repair", "fixture", {});
+  sqliteExec(config.dbPath, `UPDATE agent_runs SET owner_pid = 999999 WHERE id = ${firstInterrupted.id};`);
+  assert.equal(recoverInterruptedAgentRuns(config.dbPath), 1);
+  const recoveryPosts = () => posts.filter(post => post[0].slackIssueId === recoveryIssue.id && post[1] === "repair_needs_review");
+  agent.scheduleSlackInvestigations();
+  await agent.slackInvestigationPromise;
+  assert.equal(recoveryPosts().length, 1);
+  assert.match(recoveryPosts()[0][3], /process was interrupted/);
+  assert.equal(recoveryPosts()[0][2], `slack-repair-failure-published:${recoveryJob.id}:${firstInterrupted.id}`);
+  agent.scheduleSlackInvestigations();
+  await agent.slackInvestigationPromise;
+  assert.equal(recoveryPosts().length, 1);
+
+  // Evidence from an already-published failure must not hide interruption of a
+  // newer retry, even though that evidence survives in the investigation.
+  agent.recordRepairFailureForOperatorReview(recoveryJob.id, "fixture", "Original timeout", { agentRunId: firstInterrupted.id });
+  await agent.publishSlackRepairFailure(recoveryJob.id);
+  assert.equal(recoveryPosts().length, 1);
+  transitionJob(config.dbPath, recoveryJob.id, ["failed_retryable"], "executing");
+  const secondInterrupted = createAgentRun(config.dbPath, recoveryJob.id, "repair", "fixture", {});
+  sqliteExec(config.dbPath, `UPDATE agent_runs SET owner_pid = 999999 WHERE id = ${secondInterrupted.id};`);
+  assert.equal(recoverInterruptedAgentRuns(config.dbPath), 1);
+  agent.scheduleSlackInvestigations();
+  await agent.slackInvestigationPromise;
+  assert.equal(recoveryPosts().length, 2);
+  assert.equal(recoveryPosts()[1][2], `slack-repair-failure-published:${recoveryJob.id}:${secondInterrupted.id}`);
+  assert.match(recoveryPosts()[1][3], /process was interrupted/);
+  await agent.publishSlackRepairFailure(recoveryJob.id);
+  assert.equal(recoveryPosts().length, 2);
+
+  // A genuinely newer preparation failure has no run. Its returnedAt remains
+  // the identity, including equal-millisecond run/failure timestamps.
+  agent.recordRepairFailureForOperatorReview(recoveryJob.id, "fixture", "Media service unavailable");
+  await agent.publishSlackRepairFailure(recoveryJob.id);
+  assert.equal(recoveryPosts().length, 3);
+  const savedFailure = agent.jobDetails(recoveryJob.id).investigation.evidence.previousRepairFailure;
+  assert.equal(recoveryPosts()[2][2], `slack-repair-failure-published:${recoveryJob.id}:${savedFailure.returnedAt}`);
+  assert.match(recoveryPosts()[2][3], /could not be reached/);
+  agent.scheduleSlackInvestigations();
+  await agent.slackInvestigationPromise;
+  assert.equal(recoveryPosts().length, 3);
+
+  // Closing/reopening/result-delivery failures have their own publication.
+  // Stale repair evidence must not create an additional repair-failed notice.
+  recordAudit(config.dbPath, "issue_close_failed", { error: "Delivery failed" }, recoveryJob.id);
+  await agent.publishSlackRepairFailure(recoveryJob.id);
+  agent.scheduleSlackInvestigations();
+  await agent.slackInvestigationPromise;
+  assert.equal(recoveryPosts().length, 3);
   console.log("media-issue-agent Slack workflow tests passed");
 } finally {
   await rm(root, { recursive: true, force: true });

@@ -28,6 +28,7 @@ import {
 import { appendDiagnosticLog, createDiagnosticLogger } from "../src/diagnostic-log.js";
 import { issueTableMarkdown } from "../src/issues.js";
 import { redactText } from "../src/redact.js";
+import { publicSlackRepairProgress } from "../src/slack-progress.js";
 import { createWebHandler } from "../src/web.js";
 
 async function tempDir() {
@@ -529,6 +530,85 @@ async function testRepairAbortCancelsInFlightMcpRequest() {
   }
 }
 
+async function testRepairProxyPreservesToolErrorTelemetry() {
+  const root = await tempDir();
+  let upstreamServer;
+  try {
+    const replies = [
+      { isError: true, content: [{ type: "text", text: "Permission denied for private-viewer@example.invalid at /private/media/file.mkv" }] },
+      { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "ENOSPC: no space left on device" }) }] },
+      { content: [{ type: "text", text: JSON.stringify({ queueSize: 2 }) }] },
+      { isError: true, content: [{ type: "text", text: "Media service request timed out" }] }
+    ];
+    let calls = 0;
+    upstreamServer = http.createServer((req, res) => {
+      req.resume();
+      calls += 1;
+      res.writeHead(200, { "content-type": calls < 4 ? "application/json" : "text/event-stream" });
+      if (calls === 5) {
+        const envelopes = [{ jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } },
+          { jsonrpc: "2.0", id: 52, result: replies[2] }, { jsonrpc: "2.0", id: 51, result: replies[1] }];
+        res.end(": keepalive\r\n\r\n" + envelopes.map(value => `event: message\r\ndata: ${JSON.stringify(value)}\r\n\r\n`).join(""));
+      } else {
+        const envelope = JSON.stringify({ jsonrpc: "2.0", id: calls, result: replies[calls - 1] });
+        res.end(calls === 4 ? `event: message\ndata: ${envelope}\n\n` : envelope);
+      }
+    });
+    await new Promise(resolve => upstreamServer.listen(0, "127.0.0.1", resolve));
+    const codexHome = await createAuthHome(root);
+    const codexBin = await writeExecutable(path.join(root, "codex-tool-error.mjs"), [
+      "#!/usr/bin/env node",
+      "import { readFileSync } from 'node:fs';",
+      "readFileSync(0, 'utf8');",
+      "const arg = process.argv.find(arg => arg.startsWith('mcp_servers.media.url='));",
+      "const url = JSON.parse(arg.slice(arg.indexOf('=') + 1));",
+      "for (let id = 1; id <= 4; id++) {",
+      "  const response = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${process.env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: id === 3 ? 'sonarr_queue' : 'sonarr_refresh_series', arguments: {} } }) });",
+      "  const text = await response.text();",
+      "  const body = JSON.parse(id === 4 ? text.split('\\n').find(line => line.startsWith('data:')).slice(5) : text);",
+      "  if (response.status !== 200 || body.id !== id || (id !== 3 && body.result.isError !== true)) process.exit(44);",
+      "}",
+      "const batch = [{ jsonrpc: '2.0', id: 51, method: 'tools/call', params: { name: 'sonarr_refresh_series' } }, { jsonrpc: '2.0', id: 52, method: 'tools/call', params: { name: 'sonarr_queue' } }];",
+      "const batchResponse = await fetch(url, { method: 'POST', headers: { authorization: `Bearer ${process.env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify(batch) });",
+      "if (!(await batchResponse.text()).includes('event: message')) process.exit(45);",
+      "process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Fixture tool error checks complete.' } }) + '\\n');"
+    ].join("\n"));
+    const events = [];
+    await runCodexRepair({
+      ...configFor(root, codexHome, codexBin),
+      mediaMcpUrl: `http://127.0.0.1:${upstreamServer.address().port}/mcp`
+    }, "fixture repair tool errors", {}, { onEvent: event => events.push(event) });
+    assert.equal(calls, 5);
+    const results = events.filter(event => event.type === "repair_mcp_tool_result");
+    assert.equal(results.length, 5);
+    assert.equal(results[0].status, 200);
+    assert.equal(results[0].result[0].isError, true, "Plain-text MCP tool errors keep their failure envelope");
+    assert.match(results[0].result[0].error, /Permission denied/);
+    assert.equal(results[1].result[0].isError, true, "JSON-text MCP tool errors keep their failure envelope");
+    assert.match(results[1].result[0].error, /ENOSPC/);
+    assert.deepEqual(results[2].result, [{ queueSize: 2 }], "Successful result projection stays unchanged");
+    assert.equal(results[3].result[0].isError, true, "Real Streamable HTTP SSE errors preserve their failure envelope");
+    assert.match(results[3].result[0].error, /timed out/);
+    assert.equal(results[4].result[0].isError, true, "Out-of-order SSE batch results are matched to request IDs");
+    assert.deepEqual(results[4].result[1], { queueSize: 2 });
+    const progress = publicSlackRepairProgress({
+      job: { state: "executing" },
+      agentRuns: [{ id: 1, kind: "repair", status: "running", heartbeatAt: new Date().toISOString() }],
+      agentRunEvents: events.map((event, index) => ({ id: index + 1, runId: 1, eventType: event.type, payload: event, createdAt: new Date().toISOString() }))
+    });
+    assert.match(progress, /Latest error: Sonarr metadata refresh request.*storage is full/);
+    assert.match(progress, /Recent calls returned: Sonarr download queue check/);
+    assert.doesNotMatch(progress, /Recent calls returned:[^\n]*metadata refresh|private-viewer|private\/media/);
+  } finally {
+    if (upstreamServer) {
+      const closing = new Promise(resolve => upstreamServer.close(resolve));
+      upstreamServer.closeAllConnections?.();
+      await closing;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testPublicDetailsAndTextRedaction() {
   const root = await tempDir();
   try {
@@ -692,6 +772,7 @@ async function run() {
   await testCodexTimeoutKillsIgnoringProcessTree();
   await testRepairTelemetryFailureDoesNotFailExecution();
   await testRepairAbortCancelsInFlightMcpRequest();
+  await testRepairProxyPreservesToolErrorTelemetry();
   await testPublicDetailsAndTextRedaction();
   await testWebMutationProtection();
   await testAuthShapeAndFreshStatus();

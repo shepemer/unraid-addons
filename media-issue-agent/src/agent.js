@@ -92,8 +92,8 @@ import { createDiagnosticLogger } from "./diagnostic-log.js";
 import { pushoverConfigured, sendPushoverMessage } from "./pushover.js";
 import { parseSlackIntentResult, queueSlackIssueMessage, selectSeerrMediaMatch, SlackService } from "./slack.js";
 import { runSlackChatReply } from "./slack-chat.js";
-import { publicSlackInvestigationSummary } from "./slack-readonly.js";
 import { publicSlackResolution } from "./slack-resolution.js";
+import { publicSlackRepairProgress, slackRepairFailureAttempt } from "./slack-progress.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -2204,6 +2204,7 @@ export class MediaIssueAgent {
     this.pollPromise = null;
     this.slackInvestigationPromise = null;
     this.slackControlRuns = new Map();
+    this.slackFailurePublications = new Map();
     this.slackDiagnosticRunner = options.slackDiagnosticRunner || runCodexSlackChat;
     this.slackReplyRunner = options.slackReplyRunner || runSlackChatReply;
     this.slackPlanSummaryRunner = options.slackPlanSummaryRunner || runCodexSlackPlanSummary;
@@ -3225,8 +3226,16 @@ export class MediaIssueAgent {
     const issue = slackIssueForId(this.config.dbPath, issueId);
     if (!issue) return { message: "I could not find this issue." };
     const job = ensureJob(this.config.dbPath, "slack", String(issueId));
+    const details = this.jobDetails(job.id);
+    const progress = publicSlackRepairProgress(details, {
+      activeRun: this.activeRepairRuns.get(Number(job.id)),
+      staleAfterMs: (this.config.recoverStaleRunSeconds || 120) * 1000
+    });
     if (job.state === "awaiting_resolution_approval") {
-      return { kind: "issue_status", message: `Slack issue #${issue.id} is awaiting final owner review. ${publicSlackResolution(this.jobDetails(job.id))} Reply ‘approve resolution’ to approve, or ‘steer: …’ to revise.` };
+      const sentences = publicSlackResolution(details).split(/(?<=[.!?])\s+/);
+      const scope = sentences.find(sentence => sentence.startsWith("Final approval "));
+      const result = sentences.filter(sentence => sentence !== scope && !/^\d+ completed steps were recorded\./.test(sentence)).slice(0, 3).map(sentence => `• ${sentence}`).join("\n");
+      return { kind: "issue_status", message: `Slack issue #${issue.id} is awaiting final owner review.\n${result}${scope ? `\n${scope}` : ""}\nReply ‘approve resolution’ to approve, or ‘steer: …’ to revise.` };
     }
     const stateMessages = {
       detected: "The read-only investigation is queued.",
@@ -3243,6 +3252,14 @@ export class MediaIssueAgent {
       failed_terminal: "The last attempt needs owner guidance. Reply ‘steer: …’ or ‘re-investigate’ here.",
       blocked_needs_human: "This issue needs owner guidance. Reply ‘steer: …’ or ‘re-investigate’ here."
     };
+    const repairStates = ["executing", "drafting_comment", "failed_retryable", "failed_terminal", "blocked_needs_human"];
+    if (progress && repairStates.includes(job.state)) {
+      const guidance = job.state === "failed_retryable"
+        ? "\nThe owner can reply ‘retry repair’, ‘re-investigate’, or ‘steer: …’."
+        : ["failed_terminal", "blocked_needs_human"].includes(job.state) ? "\nThe owner can reply ‘re-investigate’ or ‘steer: …’."
+          : job.state === "drafting_comment" ? "\nThe result is being prepared for separate final owner review." : "";
+      return { kind: "issue_status", message: `Slack issue #${issue.id}: ${progress}${guidance}` };
+    }
     return { kind: "issue_status", message: `Slack issue #${issue.id}: ${stateMessages[job.state] || "I’m checking the current workflow state."}` };
   }
 
@@ -3276,6 +3293,7 @@ export class MediaIssueAgent {
           if (issue.status === "closed") setSlackIssueStatus(this.config.dbPath, issue.id, "open");
           supersedeAllPendingApprovals(this.config.dbPath, job.id);
           if (job.state !== "detected") transitionJob(this.config.dbPath, job.id, [job.state], "detected");
+          setSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`, true);
         }
         this.scheduleSlackPoll("owner_steering", issue.id);
         response = { message: busy
@@ -3287,6 +3305,7 @@ export class MediaIssueAgent {
         supersedeAllPendingApprovals(this.config.dbPath, job.id);
         if (issue.status === "closed") setSlackIssueStatus(this.config.dbPath, issue.id, "open");
         if (job.state !== "detected") transitionJob(this.config.dbPath, job.id, [job.state], "detected");
+        setSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`, true);
         this.scheduleSlackPoll("owner_reinvestigate", issue.id);
         response = { message: "I queued a fresh read-only investigation. I’ll post the findings here and ask for approval before any repair." };
       } else if (action === "retry_repair") {
@@ -3315,15 +3334,26 @@ export class MediaIssueAgent {
 
   startSlackControlWork(jobId, work) {
     if (this.slackControlRuns.has(jobId)) return;
-    const promise = Promise.resolve().then(work).then(async result => {
-      const message = result?.refreshedForNewEvidence
-        ? "New evidence arrived, so I refreshed the investigation. Please review and approve the revised plan separately."
-        : (await this.slackIssueStatus(jobForId(this.config.dbPath, jobId).issueId)).message;
-      this.queueSlackJobUpdate(jobId, "owner_control_completed", `owner-control-result:${jobId}:${Date.now()}`, message);
-    }).catch(error => {
+    const promise = Promise.resolve().then(work).then(async () => {
+      // The lifecycle publisher owns the result message. Posting another status
+      // here duplicated both failed repairs and successful final-review notices.
+      const state = jobForId(this.config.dbPath, jobId)?.state;
+      if (state === "awaiting_action_approval") await this.publishSlackInvestigation(jobId);
+      if (state === "awaiting_resolution_approval") await this.publishSlackResolution(jobId);
+      if (["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(state)) await this.publishSlackRepairFailure(jobId);
+    }).catch(async error => {
       this.diagnostic("warn", "slack_owner_work_failed", { jobId, error: error.message });
-      this.queueSlackJobUpdate(jobId, "owner_control_failed", `owner-control-failed:${jobId}:${Date.now()}`,
-        "The requested work could not finish. Ask for status or re-investigate before trying another repair approval.");
+      const state = jobForId(this.config.dbPath, jobId)?.state;
+      if (["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(state)) {
+        await this.publishSlackRepairFailure(jobId);
+      } else {
+        this.queueSlackJobUpdate(jobId, "owner_control_failed", `owner-control-failed:${jobId}:${Date.now()}`,
+          "The requested work could not finish. Ask for status or re-investigate before trying another repair approval.");
+      }
+    }).catch(error => {
+      // Outbound delivery can fail independently of the repair. Leave the
+      // durable lifecycle state for the next poll without an unhandled rejection.
+      this.diagnostic("warn", "slack_owner_result_publish_failed", { jobId, error: error.message });
     }).finally(() => this.slackControlRuns.delete(jobId));
     this.slackControlRuns.set(jobId, promise);
   }
@@ -3655,7 +3685,9 @@ export class MediaIssueAgent {
         if (["detected", "queued_for_investigation"].includes(job.state)) {
           const location = this.latestSnapshotLocationFor("slack", record.issueId);
           if (!location) continue;
-          this.queueSlackJobUpdate(job.id, "investigation_started", `auto-investigation:${job.id}:${record.evidenceVersion}`,
+          const announced = getSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`, false);
+          if (announced) deleteSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`);
+          else this.queueSlackJobUpdate(job.id, "investigation_started", `auto-investigation:${job.id}:${record.evidenceVersion}`,
             "I’m checking this issue now. I’ll post the findings and next steps here; repairs still require owner approval.");
           try {
             await this.investigate(location.snapshotId, location.index, { force: true });
@@ -3672,6 +3704,7 @@ export class MediaIssueAgent {
         const current = jobForId(this.config.dbPath, job.id);
         if (current?.state === "awaiting_action_approval") await this.publishSlackInvestigation(job.id);
         if (current?.state === "awaiting_resolution_approval") await this.publishSlackResolution(job.id);
+        if (["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(current?.state)) await this.publishSlackRepairFailure(job.id);
       }
     }).catch(error => this.diagnostic("error", "slack_auto_investigation_failed", { error: error.message }))
       .finally(() => {
@@ -3689,7 +3722,6 @@ export class MediaIssueAgent {
     if (!issue || !approval) return;
     const key = `slack-investigation-published:${jobId}:${approval.id}`;
     if (getSetting(this.config.dbPath, key, false)) return;
-    let findings = "The investigation is complete. The proposed repair is ready for owner review.";
     let planSummary;
     try {
       const settings = this.codexSettings().effective;
@@ -3699,30 +3731,23 @@ export class MediaIssueAgent {
     } catch (error) {
       this.diagnostic("warn", "slack_plan_summary_failed", { jobId, error: error.message });
     }
-    try {
-      const answer = await this.slackReadOnlyChat({
-        newestMessage: "Summarize the verified findings for this issue and useful next diagnostic or repair steps. The investigation is complete; repair has not been approved.",
-        recentMessages: [{ direction: "inbound", text: issue.description }],
-        request: { mediaTitle: issue.mediaTitle },
-        workflow: publicSlackInvestigationSummary(details)
-      }, { slackIssueId: issue.id, threadId: issue.threadId });
-      if (answer.message) findings = answer.message;
-    } catch (error) {
-      this.diagnostic("warn", "slack_investigation_public_summary_failed", { jobId, error: error.message });
-    }
     // New evidence/steering may supersede this plan while the public summary runs.
     const latest = pendingApprovalForJob(this.config.dbPath, jobId, "action");
     if (latest?.id !== approval.id || jobForId(this.config.dbPath, jobId)?.state !== "awaiting_action_approval") return;
-    const scope = planSummary?.approvalScope || (approval.payload?.plan?.executionMode === "none"
-      ? "Approval skips server changes and prepares the result for separate final review."
-      : "Approval authorizes Codex to inspect this reported issue, choose and carry out media-side repairs, and verify the result. Posting the resolution and closing the issue need separate approval.");
+    const mode = approval.payload?.plan?.executionMode;
+    const scope = mode === "none"
+      ? "Approval skips media changes and moves to final review."
+      : mode === "approved_repair_agent"
+        ? "Approval lets Codex inspect, choose and perform media-side repairs, then verify this issue."
+        : "Review the authorization scope in the Web UI before approving.";
     const planText = planSummary
-      ? `Investigation: ${planSummary.findings.join("; ")}. Proposed steps: ${planSummary.actions.join("; ")}.`
-      : "The detailed investigation is available in the owner Web UI; its public summary could not be generated.";
+      ? ["*Findings*", ...planSummary.findings.slice(0, 2).map(text => `• ${text}`),
+        "", "*Proposed work*", ...planSummary.actions.slice(0, 3).map(text => `• ${text}`)].join("\n")
+      : "The public summary is unavailable. Review the investigation in the Web UI.";
     await this.slackService.enqueueThreadReply({
       slackIssueId: issue.id, threadId: issue.threadId, channelId: issue.channelId, rootTs: issue.rootTs
     }, "investigation_ready", key,
-    `${planText}\nCurrent read-only checks: ${findings.slice(0, 1500)}\n${scope}\nOwner review needed: reply ‘approve repair’ to authorize this scope, ‘steer: …’ to change direction, or ‘re-investigate’ to check again. No repair has started.`,
+    `*Investigation complete*\n\n${planText}\n\n${scope} Posting the resolution and closing require separate approval.\n\nReply \`approve repair\`, \`steer: …\`, or \`re-investigate\`. No repair has started.`,
     { notifyOwners: true });
     setSetting(this.config.dbPath, key, true);
   }
@@ -3739,9 +3764,35 @@ export class MediaIssueAgent {
     await this.slackService.enqueueThreadReply({
       slackIssueId: issue.id, threadId: issue.threadId, channelId: issue.channelId, rootTs: issue.rootTs
     }, "repair_result_ready", key,
-    `${publicSlackResolution(details)} Owner review needed: reply ‘approve resolution’ for final approval, ‘steer: …’ to revise the approach, or ‘re-investigate’ to check again.`,
+    `*Repair result ready*\n\n${publicSlackResolution(details).split(/(?<=\.)\s+/).map(text => `• ${text}`).join("\n")}\n\nReply \`approve resolution\`, \`steer: …\`, or \`re-investigate\`.`,
     { notifyOwners: true });
     setSetting(this.config.dbPath, key, true);
+  }
+
+  async publishSlackRepairFailure(jobId) {
+    if (!this.slackService) return;
+    const details = this.jobDetails(jobId);
+    if (details?.job?.source !== "slack"
+      || !["failed_retryable", "failed_terminal", "blocked_needs_human"].includes(details.job.state)) return;
+    const issue = slackIssueForId(this.config.dbPath, Number(details.job.issueId));
+    if (!issue) return;
+    const attempt = slackRepairFailureAttempt(details);
+    if (attempt === null) return;
+    const key = `slack-repair-failure-published:${jobId}:${attempt}`;
+    if (getSetting(this.config.dbPath, key, false)) return;
+    if (this.slackFailurePublications.has(key)) return this.slackFailurePublications.get(key);
+    const publication = Promise.resolve().then(async () => {
+      const progress = publicSlackRepairProgress(details) || "The repair stopped without a detailed activity record.";
+      const next = details.job.state === "failed_retryable"
+        ? "Reply `retry repair`, `re-investigate`, or `steer: …`."
+        : "Reply `re-investigate` or `steer: …`.";
+      await this.slackService.enqueueThreadReply({
+        slackIssueId: issue.id, threadId: issue.threadId, channelId: issue.channelId, rootTs: issue.rootTs
+      }, "repair_needs_review", key, `${progress}\n\n${next} The issue remains open.`, { notifyOwners: true });
+      setSetting(this.config.dbPath, key, true);
+    }).finally(() => this.slackFailurePublications.delete(key));
+    this.slackFailurePublications.set(key, publication);
+    return publication;
   }
 
   async onSlackIssueCreated(issue) {
@@ -4783,11 +4834,13 @@ export class MediaIssueAgent {
       repairResult: context.repairResult || null,
       message
     }), jobId);
-    this.queueSlackJobUpdate(
-      jobId,
-      "repair_needs_review",
-      `repair-needs-review:${jobId}:${context.agentRunId || Date.now()}`,
-      "The repair could not be completed automatically and needs operator review. The issue remains open."
+    if (this.slackService) {
+      void this.publishSlackRepairFailure(jobId).catch(error => {
+        this.diagnostic("warn", "slack_repair_failure_publish_failed", { jobId, error: error.message });
+      });
+    } else this.queueSlackJobUpdate(
+      jobId, "repair_needs_review", `repair-needs-review:${jobId}:${context.agentRunId || Date.now()}`,
+      `${publicSlackRepairProgress(this.jobDetails(jobId))}\n\nThe issue remains open. Reply \`re-investigate\` or \`steer: …\`.`
     );
     return {
       jobId,
