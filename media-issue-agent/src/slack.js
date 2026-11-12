@@ -6,6 +6,7 @@ import {
   applySlackIssueEvidenceMessage,
   claimSlackInbound,
   claimSlackOutbox,
+  cancelSlackOutbox,
   completeSlackInbound,
   completeSlackOutbox,
   consumeSlackRateLimit,
@@ -49,6 +50,7 @@ import {
 import { redactText } from "./redact.js";
 import { pushoverConfigured, sendSlackPushoverMessage } from "./pushover.js";
 import { publicResearchTimeframe } from "./slack-readonly.js";
+import { createSlackResearchAuthorization, validateSlackResearchAuthorization, playbackBinding, playbackGrant, savePlaybackBinding, removePlaybackBinding, revokePlaybackGrant, guardPlaybackReply, playbackReplyAllowed } from "./slack-authorization.js";
 
 export const SLACK_LIMITS = Object.freeze({
   userInteractionsPerTenMinutes: 180,
@@ -274,12 +276,12 @@ function asksForIssueExplanation(value) {
     || /^(?:ok(?:ay)?[, ]+)?(?:do that|check that|look into it)[.!?]*$/.test(text);
 }
 
-export function obviousSlackPromptInjection(value) {
+export function obviousSlackPromptInjection(value, options = {}) {
   const text = stripSlackMentions(value).toLowerCase();
-  return /\bignore (?:all )?(?:previous|prior|above|system|developer) instructions?\b/.test(text)
-    || /\b(?:reveal|print|dump|repeat|show)\b.{0,80}\b(?:system prompt|developer message|hidden instructions?|credentials?|secrets?|tokens?)\b/.test(text)
-    || /\b(?:bypass|disable|override)\b.{0,80}\b(?:approval|guardrail|safety|policy|sandbox|permission)\b/.test(text)
-    || /\b(?:prompt injection|jailbreak)\b/.test(text)
+  return /\b(?:reveal|print|dump|repeat|show)\b.{0,80}\b(?:system prompt|developer message|hidden instructions?|credentials?|secrets?|tokens?)\b/.test(text)
+    || (!options.configuredOwner && (/\bignore (?:all )?(?:previous|prior|above|system|developer) instructions?\b/.test(text)
+      || /\b(?:bypass|disable|override)\b.{0,80}\b(?:approval|guardrail|safety|policy|sandbox|permission)\b/.test(text)
+      || /\b(?:prompt injection|jailbreak)\b/.test(text)))
     || /<(?:system|developer|assistant)>|\[(?:system|developer)\]/.test(text);
 }
 
@@ -425,6 +427,9 @@ export function parseSlackIntentResult(output) {
   const result = {
     intent,
     confidence,
+    playbackDiagnostic: parsed.playbackDiagnostic === true,
+    playbackTarget: ["self", "thread", "named"].includes(parsed.playbackTarget) ? parsed.playbackTarget : "",
+    playbackUserQuery: typeof parsed.playbackUserQuery === "string" ? parsed.playbackUserQuery.trim().slice(0, 200) : "",
     hasNewIssueEvidence: parsed.hasNewIssueEvidence === true,
     explicitIssueControl: parsed.explicitIssueControl === true,
     ...(parsed.shouldRespond !== undefined ? { shouldRespond: parsed.shouldRespond } : {}),
@@ -958,6 +963,31 @@ export class SlackSocketTransport {
     );
   }
 
+  async userProfile(userId) {
+    const response = await this.web.users.info({ user: userId });
+    const user = response.user || {};
+    if (user.id !== userId || user.deleted || user.is_bot || (user.team_id && user.team_id !== this.teamId)) return null;
+    return { userId, names: [...new Set([user.profile?.display_name, user.profile?.real_name, user.real_name, user.name].filter(value => typeof value === "string" && value.trim()).map(value => value.trim().slice(0, 200)))],
+      email: typeof user.profile?.email === "string" ? user.profile.email : null };
+  }
+
+  async threadHistory(item) {
+    if (item.messageTs === item.rootTs) return [];
+    let messages;
+    try {
+      const response = await this.web.conversations.replies({ channel: item.channelId, ts: item.rootTs, limit: 20 });
+      messages = response.messages;
+    } catch {
+      // Bot tokens may read channel history but lack access to replies. The
+      // exact root still establishes who reported the problem and its symptom.
+      const response = await this.web.conversations.history({ channel: item.channelId, oldest: item.rootTs, latest: item.rootTs, inclusive: true, limit: 1 });
+      messages = response.messages;
+    }
+    return (messages || []).filter(message => !message.bot_id && message.user && Number(message.ts) <= Number(item.messageTs)
+      && (message.ts === item.rootTs || message.thread_ts === item.rootTs))
+      .map(message => ({ userId: message.user, messageTs: message.ts, text: String(message.text || "").slice(0, 4000), direction: "inbound" }));
+  }
+
   status() {
     return {
       connected: this.connected,
@@ -1366,7 +1396,7 @@ export class SlackService {
         contentDigest
       });
     }
-    if (obviousSlackPromptInjection(normalizedText)) {
+    if (obviousSlackPromptInjection(normalizedText, { configuredOwner: this.isOwner(item.userId) })) {
       return this.rejectInbound(item, "prompt_injection", {
         normalizedText,
         contentDigest,
@@ -1463,7 +1493,25 @@ export class SlackService {
             latencyMs: parsed.latencyMs
           });
           if (decision.verdict === "block") {
-            safeMessage = outboundModerationFallback(decision.category);
+            let replacement = "";
+            if (decision.category === "harassment" && decision.flaggedCategories.every(category => category === "harassment")
+              && typeof this.agent.slackOutboundRewrite === "function") {
+              try {
+                const reviewed = await this.agent.slackOutboundRewrite({ draft: safeMessage, newestMessage: item.text,
+                  identities: [item.userName, ...(options.authorization?.targets || []).flatMap(target => target.queries.map(value => value.query))].filter(Boolean) });
+                if (reviewed.message && !highConfidenceSlackSafetyCategory(reviewed.message)) {
+                  const retry = await this.moderationClient.moderate(reviewed.message);
+                  const checked = decideSlackModeration(retry, { direction: "outbound", allowMildHarassment: reviewed.mildBanter === true });
+                  recordSlackOutboundModeration(this.dbPath, `${dedupeKey}:rewrite`, {
+                    verdict: checked.verdict, category: checked.category, categories: retry.categories, categoryScores: retry.categoryScores,
+                    model: retry.model, policyVersion: SLACK_MODERATION_POLICY_VERSION,
+                    contentDigest: keyedSlackContentDigest(reviewed.message, this.pendingEncryptionKey), latencyMs: retry.latencyMs
+                  });
+                  if (checked.verdict === "allow") replacement = formatSlackMessage(reviewed.message, 3500);
+                }
+              } catch { /* Keep blocked output out of the outbox if editing fails. */ }
+            }
+            safeMessage = replacement || outboundModerationFallback(decision.category);
           }
         } catch (error) {
           recordSlackOutboundModeration(this.dbPath, dedupeKey, {
@@ -1496,6 +1544,10 @@ export class SlackService {
       }
     }
     if (options.shouldEnqueue && !options.shouldEnqueue()) return null;
+    if (options.authorization?.mode && options.authorization.mode !== "public") {
+      guardPlaybackReply(this.config, dedupeKey, options.authorization);
+      kind = "authorized_research";
+    }
     return enqueueSlackOutbox(this.dbPath, {
       slackIssueId: item.slackIssueId || null,
       threadId: item.threadId,
@@ -1508,6 +1560,10 @@ export class SlackService {
   }
 
   async processInbound(item) {
+    item.authorizationBoundary = createSlackResearchAuthorization(this.config, {
+      mode: "public", actorUserId: item.userId, teamId: item.teamId, channelId: item.channelId,
+      threadId: item.threadId, eventId: item.eventId
+    });
     let participation = slackParticipation(item, this.botUserId, this.config.slackChannelId);
     if (!item.pendingCiphertext && participation.channelKind === "channel"
       && !participation.explicitMention && obviousSlackSocialMessage(item.text)) {
@@ -1558,6 +1614,7 @@ export class SlackService {
     }
     const directedToBot = participation.explicitMention || participation.channelKind === "dm";
     const allowShortcut = directedToBot || !participation.addressesOtherUser;
+    if (allowShortcut && await this.handlePlaybackControl(item)) return;
     const control = item.slackIssueId && allowShortcut ? parseSlackIssueControl(item.text) : null;
     if (control) {
       await this.handleIssueControl(item, control);
@@ -1568,7 +1625,13 @@ export class SlackService {
       return;
     }
     await this.resolveUserName(item);
-    const recentMessages = slackMessagesForThread(this.dbPath, item.threadId, 11)
+    const archivedMessages = slackMessagesForThread(this.dbPath, item.threadId, 21);
+    let historicalMessages = [];
+    if (item.rootTs !== item.messageTs && !archivedMessages.some(message => message.messageTs === item.rootTs)) {
+      try { historicalMessages = await this.transport.threadHistory?.(item) || []; } catch { /* Older context may be unavailable; never guess its author. */ }
+    }
+    item.researchMessages = [...historicalMessages, ...archivedMessages].filter((message, index, all) => all.findIndex(other => other.messageTs === message.messageTs) === index);
+    const recentMessages = item.researchMessages
       .filter(message => Number(message.id) !== Number(item.messageId)
         && (message.direction !== "inbound" || Number(message.messageTs) < Number(item.messageTs)))
       .slice(-10)
@@ -1584,11 +1647,15 @@ export class SlackService {
       recentMessages,
       newestMessage: compact(stripSlackMentions(item.text), 4000)
     };
+    const authorization = await this.researchAuthorization(item);
+    if (!validateSlackResearchAuthorization(this.config, item.authorizationBoundary, item)) return;
     let result = await this.agent.classifySlackIntent(context, {
+      authorization, userId: item.userId, teamId: item.teamId, channelId: item.channelId,
       eventId: item.eventId,
       threadId: item.threadId,
       slackIssueId: item.slackIssueId || null
     });
+    if (!validateSlackResearchAuthorization(this.config, item.authorizationBoundary, item)) return;
     const inferredChoice = item.slackIssueId
       ? []
       : inferSlackMediaRequestChoice(item.text, recentMessages);
@@ -1624,6 +1691,85 @@ export class SlackService {
     await this.enqueueThreadReply(item, answer.kind || "issue_status", `issue-status:${item.eventId}`, answer.message);
   }
 
+  async playbackProfile(userId, item) {
+    if (!/^[UW][A-Z0-9]{2,}$/.test(userId || "")) return null;
+    try { return await this.transport.userProfile?.(userId) || null; } catch { return null; }
+  }
+
+  async researchAuthorization(item, request = {}) {
+    const base = { actorUserId: item.userId, teamId: item.teamId, channelId: item.channelId, threadId: item.threadId, eventId: item.eventId };
+    const grant = playbackGrant(this.config, item);
+    if (this.isOwner(item.userId)) {
+      const targets = [];
+      const query = String(request.playbackUserQuery || "").trim();
+      const normalized = value => String(value).normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}@._+-]+/gu, " ").trim();
+      const normalizedQuery = normalized(query);
+      const explicitlyNamed = normalizedQuery && (` ${normalized(item.text).replace(/[.!?,;]+$/g, "")} `).includes(` ${normalizedQuery} `);
+      const mentioned = [...String(item.text || "").matchAll(/<@([UW][A-Z0-9]+)>/g)].map(match => match[1]).filter(id => id !== this.botUserId);
+      const root = item.researchMessages?.find(message => message.messageTs === item.rootTs && message.direction === "inbound");
+      const subject = request.playbackTarget === "self" ? item.userId : mentioned[0] || (root?.userId !== item.userId ? root?.userId : null);
+      if (explicitlyNamed) targets.push({ label: "requested account", subjectSlackId: null, queries: [{ query }] });
+      if (!targets.length && subject) {
+        const binding = playbackBinding(this.config, { ...item, userId: subject });
+        const profile = binding ? null : await this.playbackProfile(subject, item);
+        const queries = binding ? [{ query: binding.resolvedUserId, matchBy: "user_id" }]
+          : profile?.email ? [{ query: profile.email, matchBy: "email" }] : (profile?.names || []).slice(0, 4).map(query => ({ query }));
+        // Display names are useful owner lookup hints, never proof that a Slack
+        // member owns the matching playback account.
+        if (queries.length) targets.push({ label: "thread participant", subjectSlackId: binding || profile?.email ? subject : null, queries });
+      }
+      if (!targets.length && grant) targets.push({ label: "thread participant", subjectSlackId: grant.subjectSlackId, queries: [{ query: grant.resolvedUserId, matchBy: "user_id" }] });
+      return createSlackResearchAuthorization(this.config, { ...base, mode: "owner", ownerDirective: item.text, targets });
+    }
+    if (request.playbackTarget === "named") return createSlackResearchAuthorization(this.config, { ...base, mode: "public" });
+    if (grant) return createSlackResearchAuthorization(this.config, { ...base, mode: "self", resolvedSelfId: grant.resolvedUserId, authorizedByOwnerId: grant.ownerId });
+    const rootAuthor = item.researchMessages?.find(message => message.messageTs === item.rootTs && message.direction === "inbound")?.userId;
+    const ownRequest = request.playbackTarget === "self" || (request.playbackTarget === "thread" && rootAuthor === item.userId)
+      || /\bmy\b.{0,100}\b(?:playback|stream|streaming|buffer|tv|history|watch[ -]?time)\b/i.test(String(item.text || ""));
+    if (ownRequest) {
+      const binding = playbackBinding(this.config, item);
+      if (binding) return createSlackResearchAuthorization(this.config, { ...base, mode: "self", resolvedSelfId: binding.resolvedUserId, authorizedByOwnerId: binding.ownerId });
+      const profile = await this.playbackProfile(item.userId, item);
+      if (profile?.email && typeof this.agent.slackPlaybackResolve === "function") {
+        try {
+          const match = await this.agent.slackPlaybackResolve(profile.email, "email");
+          if (match.status === "matched" && match.complete === true && match.candidates?.length === 1 && /^\d+$/.test(String(match.candidates[0].resolvedUserId))) {
+            return createSlackResearchAuthorization(this.config, { ...base, mode: "self", resolvedSelfId: match.candidates[0].resolvedUserId });
+          }
+        } catch { /* Identity must be verified before scoped history access. */ }
+      }
+    }
+    return createSlackResearchAuthorization(this.config, { ...base, mode: "public" });
+  }
+
+  async handlePlaybackControl(item) {
+    const text = String(item.text || "").replace(new RegExp(`<@${this.botUserId}>`, "g"), "").trim();
+    const link = text.match(/^(?:please\s+)?link\s+(?:playback|plex)(?:\s+account)?\s+<@([UW][A-Z0-9]+)>\s+to\s+(.{1,200})$/i);
+    const unlink = text.match(/^(?:please\s+)?unlink\s+(?:playback|plex)(?:\s+account)?\s+<@([UW][A-Z0-9]+)>[.! ]*$/i);
+    const revoke = /^(?:please\s+)?(?:revoke|remove|stop)\s+(?:the\s+)?(?:user\s+)?(?:playback\s+)?diagnostic(?:s|\s+access|\s+permission)(?:\s+(?:in\s+)?this\s+thread|\s+here)?[.! ]*$/i.test(text);
+    if (!link && !unlink && !revoke) return false;
+    let message;
+    if (!this.isOwner(item.userId)) message = "Only the configured server owner can link accounts or change diagnostic permissions.";
+    else if (revoke) {
+      revokePlaybackGrant(this.config, item);
+      message = "I revoked the diagnostic grant for this thread. A fresh owner request is needed to authorize another account lookup.";
+    } else if (unlink) {
+      removePlaybackBinding(this.config, item, unlink[1]);
+      message = "I removed that playback account link and invalidated its earlier diagnostic grants.";
+    } else {
+      try {
+        const profile = await this.playbackProfile(link[1], item);
+        if (!profile) throw new Error("Unknown Slack member");
+        const match = await this.agent.slackPlaybackResolve(link[2].replace(/^`|`$/g, ""), "username");
+        if (match.status !== "matched" || match.complete !== true || match.candidates?.length !== 1) throw new Error("Ambiguous account");
+        savePlaybackBinding(this.config, item, link[1], match.candidates[0].resolvedUserId);
+        message = "Linked that Slack member to the verified playback account. They can now ask me to investigate their own streaming problems.";
+      } catch { message = "I could not verify that exact account link. Use the Plex username and mention the Slack member; I will not guess between accounts."; }
+    }
+    await this.enqueueThreadReply(item, "playback_access", `playback-access:${item.eventId}`, message, { trustedTemplate: true });
+    return true;
+  }
+
   ownerUserIds() {
     const configured = this.config.slackOwnerUserIds;
     const owners = Array.isArray(configured) ? configured : String(configured || "").split(",");
@@ -1656,6 +1802,14 @@ export class SlackService {
   }
 
   async replyWithReadOnlyChat(item, result, context) {
+    if (item.authorizationBoundary && !validateSlackResearchAuthorization(this.config, item.authorizationBoundary, item)) return;
+    const authorization = await this.researchAuthorization(item, result);
+    if (item.authorizationBoundary && !validateSlackResearchAuthorization(this.config, item.authorizationBoundary, item)) return;
+    if (result.playbackDiagnostic && authorization.mode === "public") {
+      await this.enqueueThreadReply(item, "playback_identity_needed", `playback-identity:${item.eventId}`,
+        "I can investigate your playback once your Slack account is linked to your Plex account. The server owner can use `link playback @member to PlexUsername` here, or authorize this account’s diagnosis in this thread.", { trustedTemplate: true });
+      return;
+    }
     await this.enqueueThreadReply(item, "media_check_started", `media-check-started:${item.eventId}`,
       "I’m checking the live details. I’ll reply here with what I find.", { trustedTemplate: true });
     const answer = await this.agent.slackReadOnlyChat({
@@ -1664,15 +1818,28 @@ export class SlackService {
       newestMessage: context.newestMessage || compact(stripSlackMentions(item.text), 4000),
       request: result
     }, {
+      authorization, userId: item.userId, teamId: item.teamId, channelId: item.channelId,
       eventId: item.eventId,
       threadId: item.threadId,
       slackIssueId: item.slackIssueId || null
     });
-    await this.enqueueThreadReply(item, answer.kind || "media_diagnostic", `media-check-result:${item.eventId}`, answer.message);
+    await this.enqueueThreadReply(item, answer.kind || "media_diagnostic", `media-check-result:${item.eventId}`, answer.message, {
+      authorization,
+      shouldEnqueue: () => Boolean(validateSlackResearchAuthorization(this.config, authorization, { ...item }))
+    });
   }
 
   async applyIntent(item, result, context = {}) {
     const participation = slackParticipation(item, this.botUserId, this.config.slackChannelId);
+    const ownerResearch = this.isOwner(item.userId)
+      && (participation.explicitMention || participation.channelKind === "dm" || result.shouldRespond === true)
+      && !/\b(?:do not|don['’]t|never|stop|cancel|avoid|not asking)\b.{0,60}\b(?:check|diagnos\w*|investigat\w*|research|look into)\b|\b(?:what happens if|hypothetically|suppose|if I (?:ask|asked))\b/i.test(item.text || "")
+      && /\b(?:check|diagnos\w*|investigat\w*|research|look into)\b/i.test(item.text || "")
+      && /\b(?:user|account|playback|stream\w*|history|buffer\w*)\b/i.test(item.text || "");
+    if ((result.playbackDiagnostic && result.intent !== "issue_control") || (ownerResearch && ["unsupported", "conversation"].includes(result.intent))) {
+      result = { ...result, intent: "media_diagnostic", playbackDiagnostic: true, shouldRespond: true,
+        ...(this.isOwner(item.userId) ? { socialTone: "neutral" } : {}) };
+    }
     if (participation.channelKind === "channel" && !participation.explicitMention
       && (result.shouldRespond === false || (result.shouldRespond !== true
         && ["conversation", "unsupported", "needs_clarification"].includes(result.intent)))) {
@@ -1928,6 +2095,7 @@ export class SlackService {
       }
       try {
         if (!slackOutboxIsSending(this.dbPath, item.id)) continue;
+        if (!playbackReplyAllowed(this.config, item)) { cancelSlackOutbox(this.dbPath, item.id); continue; }
         const result = await this.transport.postMessage(item);
         this.lastChannelSendAt.set(item.channelId, Date.now());
         completeSlackOutbox(this.dbPath, item.id, result);
@@ -2019,6 +2187,7 @@ export class SlackService {
         break;
       }
       if (!slackOutboxIsSending(this.dbPath, item.id)) continue;
+      if (!playbackReplyAllowed(this.config, item)) { cancelSlackOutbox(this.dbPath, item.id); continue; }
       const result = await this.transport.postMessage(item);
       completeSlackOutbox(this.dbPath, item.id, result);
       sent += 1;

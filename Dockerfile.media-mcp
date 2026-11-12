@@ -44,7 +44,7 @@ RUN set -e; \
     npm ci --omit=dev \
     && npm cache clean --force
 
-COPY media-mcp/server.js media-mcp/media-filesystem.js media-mcp/plex-diagnostics.js media-mcp/download-repair.js media-mcp/public-watchtime.js ./
+COPY media-mcp/server.js media-mcp/media-filesystem.js media-mcp/plex-diagnostics.js media-mcp/download-repair.js media-mcp/public-watchtime.js media-mcp/user-playback-diagnostics.js ./
 COPY archive-tools-check /usr/local/bin/archive-tools-check
 
 RUN chmod 0755 /usr/local/bin/archive-tools-check \
