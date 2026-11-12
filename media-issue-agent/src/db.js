@@ -288,6 +288,17 @@ CREATE TABLE IF NOT EXISTS slack_outbox (
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS slack_owner_controls (
+  event_id TEXT PRIMARY KEY,
+  issue_id INTEGER NOT NULL REFERENCES slack_issues(id),
+  user_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  approval_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'started',
+  response_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS slack_rate_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   team_id TEXT NOT NULL,
@@ -978,10 +989,16 @@ export function recoverInterruptedAgentRuns(dbPath, options = {}) {
   const runs = sqliteExec(dbPath, sql`
 SELECT id, job_id AS jobId, owner_pid AS ownerPid, owner_started_at AS ownerStartedAt, started_at AS startedAt, heartbeat_at AS heartbeatAt
 FROM agent_runs
-WHERE status = 'running'
-  AND julianday(COALESCE(heartbeat_at, started_at)) <= julianday('now') - (${staleSeconds} / 86400.0);
+WHERE status = 'running';
 `, { json: true });
-  const recoverable = runs.filter(run => !ignoreLiveOwnerPids || !processMatchesOwner(run.ownerPid, run.ownerStartedAt));
+  const recoverable = runs.filter(run => {
+    const stale = Date.parse(run.heartbeatAt || run.startedAt) <= Date.now() - staleSeconds * 1000;
+    if (!ignoreLiveOwnerPids) return stale;
+    if (processMatchesOwner(run.ownerPid, run.ownerStartedAt)) return false;
+    // A demonstrably dead owner cannot resume, even immediately after restart.
+    // Legacy rows without ownership retain the heartbeat grace period.
+    return Number(run.ownerPid) > 0 || stale;
+  });
   for (const run of recoverable) {
     completeAgentRun(dbPath, run.id, "failed_retryable", null, message);
     recordAgentRunEvent(dbPath, run.id, run.jobId, "repair_recovered_after_restart", {
@@ -1922,11 +1939,19 @@ WHERE status = 'sending';
 export function claimSlackInbound(dbPath) {
   return sqliteTransaction(dbPath, database => {
     const receipt = database.prepare(`
-SELECT event_id AS eventId
-FROM slack_event_receipts
-WHERE status = 'pending'
-  AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-ORDER BY received_at, event_id
+SELECT receipt.event_id AS eventId
+FROM slack_event_receipts AS receipt
+JOIN slack_messages AS message ON message.id = receipt.message_id
+WHERE receipt.status = 'pending'
+  AND receipt.available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  AND NOT EXISTS (
+    SELECT 1 FROM slack_event_receipts AS earlier
+    JOIN slack_messages AS prior_message ON prior_message.id = earlier.message_id
+    WHERE prior_message.thread_id = message.thread_id
+      AND (earlier.status = 'processing' OR
+        (earlier.status = 'pending' AND prior_message.id < message.id))
+  )
+ORDER BY receipt.received_at, receipt.event_id
 LIMIT 1;
 `).get();
     if (!receipt) {
@@ -1988,6 +2013,34 @@ SET status = ${status},
     processed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 WHERE event_id = ${eventId};
 `);
+}
+
+// Bind an owner instruction to one event and one approval before any mutation.
+// A redelivered approval must never authorize a later repair or final closure.
+export function claimSlackOwnerControl(dbPath, values) {
+  return sqliteTransaction(dbPath, database => {
+    const result = database.prepare(sql`
+INSERT OR IGNORE INTO slack_owner_controls (event_id, issue_id, user_id, action, approval_id)
+VALUES (${values.eventId}, ${values.issueId}, ${values.userId}, ${values.action}, ${values.approvalId || null});
+`).run();
+    const row = database.prepare(sql`
+SELECT status, response_json AS responseJson FROM slack_owner_controls WHERE event_id = ${values.eventId};
+`).get();
+    return { claimed: Boolean(result.changes), status: row.status, response: row.responseJson ? JSON.parse(row.responseJson) : null };
+  });
+}
+
+export function completeSlackOwnerControl(dbPath, eventId, response) {
+  sqliteExec(dbPath, sql`
+UPDATE slack_owner_controls SET status = 'completed', response_json = ${JSON.stringify(response)}
+WHERE event_id = ${eventId};
+`);
+}
+
+export function recoverSlackInvestigations(dbPath) {
+  // Called once when the Slack service starts, before launching new workers.
+  sqliteExec(dbPath, `UPDATE jobs SET state = 'queued_for_investigation'
+WHERE source = 'slack' AND state = 'investigating';`);
 }
 
 export function retrySlackInbound(dbPath, eventId, error, delaySeconds = 5) {

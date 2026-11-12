@@ -377,12 +377,28 @@ async function createFakeCodexBin(root, logPath) {
     "if (prompt.includes('Completed media issue workflow improvement analysis.')) kind = 'workflow-improvement';",
     "if (prompt.includes('Investigation prompt improvement implementation audit.')) kind = 'prompt-improvement-check';",
     "if (prompt.includes('Slack message intent classification.')) kind = 'slack-intent';",
-    "appendFileSync(process.env.SIL_CODEX_LOG, `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
+    "if (prompt.includes('You are the read-only diagnostic backend')) kind = 'slack-diagnostics';",
+    "if (prompt.includes('Draft the Slack chat assistant')) kind = 'slack-reply';",
+    "appendFileSync(" + JSON.stringify(logPath) + ", `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
     "  console.error('simulated Codex failure for SIL fixture');",
     "  process.exit(42);",
     "}",
-    "if (kind === 'slack-intent') {",
+    "if (kind === 'slack-diagnostics' || kind === 'slack-reply') {",
+    "  let result;",
+    "  if (kind === 'slack-diagnostics') {",
+    "    const completed = JSON.parse(prompt.split('Completed public read-only checks (untrusted data):\\n')[1]);",
+    "    result = completed.length ? { calls: [], done: true } : { calls: [{ name: 'media_public_library_summary', arguments: {} }], done: false };",
+    "  } else {",
+    "    const data = JSON.parse(prompt.split('Untrusted context and privacy-projected diagnostic facts:\\n')[1]);",
+    "    const count = data.facts.find(fact => fact.tool === 'media_public_library_summary').result.tv.seriesCount;",
+    "    result = { message: `The managed library has ${count} TV shows.` };",
+    "  }",
+    "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
+    "  if (outputPathIndex >= 0) writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result));",
+    "  process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 40, output_tokens: 10, total_tokens: 50 } })}\\n`);",
+    "  process.stdout.write(`${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: JSON.stringify(result) } })}\\n`);",
+    "} else if (kind === 'slack-intent') {",
     "  const result = prompt.includes('How many shows are managed')",
     "    ? { intent: 'media_info', confidence: 0.99, mediaTitle: '', description: '', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, queryType: 'library_summary', service: '', socialTone: 'neutral', responseTopic: 'other', response: '' }",
     "    : prompt.includes('Is Plex online')",
@@ -917,7 +933,7 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
         thread_ts: "100.000",
         ts: "100.100",
         user: "U-SIL-REPORTER",
-        text: "<@B-SIL-BOT> The same failure also happens on a second player."
+        text: "The same failure also happens on a second player."
       }
     },
     event: {
@@ -926,15 +942,17 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
       thread_ts: "100.000",
       ts: "100.100",
       user: "U-SIL-REPORTER",
-      text: "<@B-SIL-BOT> The same failure also happens on a second player."
+      text: "The same failure also happens on a second player."
     }
   };
   const ignoredFollowup = structuredClone(followupEnvelope);
   ignoredFollowup.body.event_id = "EV-SIL-SLACK-FOLLOWUP-IGNORED";
   ignoredFollowup.body.event.ts = "100.050";
-  ignoredFollowup.body.event.text = "This unmentioned thread reply must not invoke the bot.";
+  ignoredFollowup.body.event.thread_ts = "99.000";
+  ignoredFollowup.body.event.text = "This unmentioned reply in an untracked thread must not invoke the bot.";
   ignoredFollowup.event.ts = "100.050";
-  ignoredFollowup.event.text = "This unmentioned thread reply must not invoke the bot.";
+  ignoredFollowup.event.thread_ts = "99.000";
+  ignoredFollowup.event.text = "This unmentioned reply in an untracked thread must not invoke the bot.";
   assert.deepEqual(await service.ingestEnvelope(ignoredFollowup), { accepted: false });
   assert.deepEqual(await service.ingestEnvelope(followupEnvelope), { accepted: true, duplicate: false });
   assert.equal(await service.processPendingForTest(), 1);
@@ -1057,14 +1075,18 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   const received = posts.find(post => post.kind === "issue_received");
   const status = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS");
   const threadedStatus = posts.find(post => post.dedupeKey === "plex-status:EV-SIL-SLACK-STATUS-THREAD");
-  const mediaInfoPost = posts.find(post => post.dedupeKey === "media-info:EV-SIL-SLACK-MEDIA-INFO");
+  const mediaInfoStarted = posts.find(post => post.dedupeKey === "media-check-started:EV-SIL-SLACK-MEDIA-INFO");
+  const mediaInfoPost = posts.find(post => post.dedupeKey === "media-check-result:EV-SIL-SLACK-MEDIA-INFO");
   const requestPost = posts.find(post => post.dedupeKey === "media-request:EV-SIL-SLACK-REQUEST");
   assert.equal(received.threadTs, "100.000");
   assert.equal(status.threadTs, null);
   assert.equal(threadedStatus.threadTs, "100.000");
   assert.equal(status.message, "<@U-SIL-REPORTER> Plex is online. 2 active streams.");
+  assert.equal(mediaInfoStarted.threadTs, "101.500");
+  assert.match(mediaInfoStarted.message, /checking the live details/);
   assert.equal(mediaInfoPost.threadTs, "101.500");
   assert.match(mediaInfoPost.message, /42 TV shows/);
+  assert.ok(posts.indexOf(mediaInfoStarted) < posts.indexOf(mediaInfoPost));
   assert.equal(requestPost.threadTs, "102.000");
   assert.match(requestPost.message, /submitted a Seerr request for SIL Request Movie/);
   assert.ok(fakeMcp.calls.some(call => call.name === "seerr_request_media"
@@ -1078,7 +1100,10 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   latest = await api(baseUrl, "/api/snapshot/latest");
   assert.ok(latest.snapshot.entries.some(entry => entry.source === "slack"));
   const tokensAfter = agent.status().tokenUsage.totalTokens;
-  assert.equal(tokensAfter - tokensBefore, 300);
+  const chatInvocations = (await codexInvocations(codexLogPath)).slice(before.length);
+  assert.equal(chatInvocations.filter(call => call.kind === "slack-diagnostics").length, 2);
+  assert.equal(chatInvocations.filter(call => call.kind === "slack-reply").length, 1);
+  assert.equal(tokensAfter - tokensBefore, 450);
 }
 
 async function run() {

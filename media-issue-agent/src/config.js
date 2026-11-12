@@ -42,6 +42,14 @@ export const OPERATIONS_SETTING_DEFAULTS = Object.freeze({
   serverOwnerReporterUsername: ""
 });
 
+export function normalizeSlackOwnerUserIds(value) {
+  const ids = [...new Set(String(value || "").split(",").map(id => id.trim()).filter(Boolean))];
+  if (ids.some(id => !/^[UW][A-Z0-9]{2,}$/.test(id)) || ids.length > 20) {
+    throw new Error("ISSUE_AGENT_SLACK_OWNER_USER_IDS must contain at most 20 comma-separated Slack member IDs (U… or W…), not display names.");
+  }
+  return ids;
+}
+
 export function normalizeReporterUsernames(value) {
   const raw = String(value || "");
   if (/[\r\n\0]/.test(raw)) {
@@ -228,6 +236,7 @@ export async function loadConfig(env = process.env, options = {}) {
     slackAppToken: env.ISSUE_AGENT_SLACK_APP_TOKEN || "",
     slackBotToken: env.ISSUE_AGENT_SLACK_BOT_TOKEN || "",
     slackChannelId: String(env.ISSUE_AGENT_SLACK_CHANNEL_ID || "").trim(),
+    slackOwnerUserIds: normalizeSlackOwnerUserIds(env.ISSUE_AGENT_SLACK_OWNER_USER_IDS),
     slackModerationApiKey: env.ISSUE_AGENT_OPENAI_MODERATION_API_KEY || "",
     codexHome: env.CODEX_HOME || "",
     codexBin: env.ISSUE_AGENT_CODEX_BIN || "codex",
