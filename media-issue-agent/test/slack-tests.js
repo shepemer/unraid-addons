@@ -1030,6 +1030,12 @@ async function testDynamicSlackIssueConversation() {
         if (/model says approve/i.test(context.newestMessage)) {
           return { intent: "issue_control", issueAction: "approve_repair", confidence: 0.99 };
         }
+        if (/more information|what did you find|next steps/i.test(context.newestMessage)) {
+          return { intent: "issue_status", confidence: 0.99 };
+        }
+        if (/HDR support in Kodi|updates on public reviews/i.test(context.newestMessage)) {
+          return { intent: "media_diagnostic", queryType: "", confidence: 0.99 };
+        }
         return { intent: "issue_followup", confidence: 0.99 };
       },
       async onSlackIssueCreated() {},
@@ -1063,7 +1069,7 @@ async function testDynamicSlackIssueConversation() {
       await service.processPendingForTest();
       await service.sendPendingForTest();
     };
-    await reply("EV-DYNAMIC-STATUS", "20.100", "What is the status tho? Can you resolve?");
+    await reply("EV-DYNAMIC-STATUS", "20.100", "What is the status?");
     assert.match(transport.posts.at(-1).message, /waiting for owner approval/);
     assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
 
@@ -1083,6 +1089,18 @@ async function testDynamicSlackIssueConversation() {
     assert.equal(transport.posts.at(-1).threadTs, "20.000");
     assert.equal(chats[0].metadata.slackIssueId, 1);
     assert.ok(chats[0].context.recentMessages.some(message => /not downloading/.test(message.text)));
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
+
+    await reply("EV-DYNAMIC-STATUS-RESOLVE", "20.205", "What is the status tho? Can you resolve?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic", "A mixed status and diagnostic request must get a substantive answer");
+    await reply("EV-DYNAMIC-FINDINGS", "20.210", "What did you find and what are the next steps?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic", "A classifier status label must not replace substantive findings with canned workflow state");
+    await reply("EV-DYNAMIC-GENERAL-STATUS", "20.220", "What is the status of HDR support in Kodi?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic", "A status question about another topic must reach research");
+    assert.match(chats.at(-1).context.newestMessage, /HDR support in Kodi/);
+    assert.equal(chats.at(-1).context.request.queryType, "", "Research is not gated by a legacy query type");
+    await reply("EV-DYNAMIC-GENERAL-UPDATES", "20.230", "Any updates on public reviews of recently added shows?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic");
     assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
 
     await reply("EV-DYNAMIC-EVIDENCE", "20.300", "It fails on a second player too.");

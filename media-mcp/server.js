@@ -6758,6 +6758,35 @@ function seerrPublicSearchRecord(record) {
   };
 }
 
+function publicCatalogMedia(record, requestedType) {
+  const mediaType = requestedType || record?.mediaType;
+  if (!["movie", "tv"].includes(mediaType) || !positiveIntOrUndefined(record?.id)) return null;
+  const title = String(record?.title || record?.name || "").trim();
+  if (!title) return null;
+  const date = String(record.releaseDate || record.firstAirDate || "");
+  const voteAverage = Number(record.voteAverage);
+  return compactObject({
+    id: positiveIntOrUndefined(record.id),
+    mediaType,
+    title: redactText(title).slice(0, 300),
+    originalTitle: redactText(String(record.originalTitle || record.originalName || "")).slice(0, 300) || undefined,
+    overview: redactText(String(record.overview || "")).slice(0, 5000) || undefined,
+    releaseDate: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined,
+    year: publicYear(date.slice(0, 4)),
+    genres: Array.isArray(record.genres) ? record.genres.slice(0, 30).map(genre => compactObject({
+      id: positiveIntOrUndefined(genre.id), name: redactText(String(genre.name || "")).slice(0, 100)
+    })) : undefined,
+    genreIds: Array.isArray(record.genreIds) ? record.genreIds.map(positiveIntOrUndefined).filter(Boolean).slice(0, 30) : undefined,
+    runtimeMinutes: mediaType === "movie" ? positiveIntOrUndefined(record.runtime) : undefined,
+    seasonCount: mediaType === "tv" ? publicInteger(record.numberOfSeasons) : undefined,
+    episodeCount: mediaType === "tv" ? publicInteger(record.numberOfEpisodes) : undefined,
+    voteAverage: Number.isFinite(voteAverage) && voteAverage >= 0 && voteAverage <= 10 ? voteAverage : undefined,
+    voteCount: Number.isFinite(Number(record.voteCount)) ? publicInteger(record.voteCount) : undefined,
+    originalLanguage: /^[a-z]{2,3}$/.test(record.originalLanguage || "") ? record.originalLanguage : undefined,
+    adult: typeof record.adult === "boolean" ? record.adult : undefined
+  });
+}
+
 async function mediaPublicRequestStatus({ title, mediaType, year }) {
   if (!configuredServices.seerr) {
     return { configured: false, available: false, status: "unavailable", candidates: [] };
@@ -10707,6 +10736,7 @@ async function serviceStatus(name) {
 
 function registerServarrConfigTools(server, serviceName, displayName) {
   server.registerTool(`${serviceName}_quality_profiles`, {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: `${displayName} Quality Profiles`,
     description: `List or get ${displayName} quality profiles by id or exact name. Set includeRaw for the full Servarr profile object, including nested qualities, cutoff, upgradeAllowed, formatItems, and format score thresholds.`,
     inputSchema: {
@@ -10729,6 +10759,7 @@ function registerServarrConfigTools(server, serviceName, displayName) {
   }, async (input) => jsonText(await updateQualityProfile(serviceName, input)));
 
   server.registerTool(`${serviceName}_custom_formats`, {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: `${displayName} Custom Formats`,
     description: `List or get ${displayName} custom formats by id or exact name. Set includeRaw for the full Servarr custom format object.`,
     inputSchema: {
@@ -10753,6 +10784,7 @@ function registerServarrConfigTools(server, serviceName, displayName) {
   }, async (input) => jsonText(await updateCustomFormat(serviceName, input)));
 
   server.registerTool(`${serviceName}_quality_definitions`, {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: `${displayName} Quality Definitions`,
     description: `List or get ${displayName} quality definitions by qualityId or exact qualityName. Set includeRaw for the full Servarr quality definition object.`,
     inputSchema: {
@@ -10821,6 +10853,7 @@ function registerThreadfinTools(server) {
   }, async (input) => jsonText(await threadfinListSources(input)));
 
   server.registerTool("threadfin_list_source_groups", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Threadfin List Source Groups",
     description: "Fetch and parse a configured Threadfin M3U source, returning group-title counts and optional sanitized channel summaries.",
     inputSchema: {
@@ -10834,6 +10867,7 @@ function registerThreadfinTools(server) {
   }, async (input) => jsonText(await threadfinListSourceGroups(input)));
 
   server.registerTool("threadfin_find_source_channels", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Threadfin Find Source Channels",
     description: "Fetch and parse a configured Threadfin M3U source, then return sanitized channel records matching group, search terms, or include tokens.",
     inputSchema: {
@@ -11063,6 +11097,7 @@ function registerThreadfinTools(server) {
   }, async (input) => jsonText(await threadfinListXmltvChannels(input)));
 
   server.registerTool("threadfin_find_xmltv_channels", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Threadfin Find XMLTV Channels",
     description: "Fetch and parse a configured Threadfin XMLTV source, returning exact and candidate guide channel matches.",
     inputSchema: {
@@ -11366,6 +11401,7 @@ function createServer() {
   }, async ({ scope, limit }) => jsonText(await diagnosticsBundle(scope, limit)));
 
   server.registerTool("media_diagnose_queue_item", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Media Diagnose Queue Item",
     description: "Diagnose one exact Sonarr or Radarr queue item and return safe candidate repair actions.",
     inputSchema: {
@@ -11375,6 +11411,7 @@ function createServer() {
   }, async ({ service, queueId }) => jsonText(await diagnoseQueueItem(service, queueId)));
 
   server.registerTool("media_queue_repair_plan", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Media Queue Repair Plan",
     description: "Return exact possible repair actions for one Sonarr or Radarr queue item.",
     inputSchema: {
@@ -11437,6 +11474,7 @@ function createServer() {
   }));
 
   server.registerTool("plex_availability", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Plex Availability",
     description: "Check whether Plex is reachable and return only its active stream count."
   }, async () => jsonText(await plexAvailability()));
@@ -11449,11 +11487,13 @@ function createServer() {
   }, async () => jsonText(await plexPublicBandwidthSummary()));
 
   server.registerTool("plex_list_libraries", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Plex List Libraries",
     description: "List Plex library sections."
   }, async () => jsonText(await plexApi("library/sections")));
 
   server.registerTool("plex_list_library_items", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Plex List Library Items",
     description: "List items in a Plex library section.",
     inputSchema: {
@@ -11467,6 +11507,7 @@ function createServer() {
   });
 
   server.registerTool("plex_search", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Plex Search",
     description: "Search Plex libraries.",
     inputSchema: {
@@ -11476,6 +11517,7 @@ function createServer() {
   }, async ({ query, limit }) => jsonText(limitPlexContainer(await plexApi("hubs/search", { query: { query } }), limit)));
 
   server.registerTool("plex_get_metadata", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Plex Get Metadata",
     description: "Get Plex metadata for a rating key.",
     inputSchema: {
@@ -11639,11 +11681,13 @@ function createServer() {
   }), length)));
 
   server.registerTool("tracearr_health", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Tracearr Health",
     description: "Get Tracearr public API health and configured media server connectivity."
   }, async () => jsonText(await tracearrApi("health")));
 
   server.registerTool("tracearr_openapi", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Tracearr OpenAPI",
     description: "Get Tracearr's public OpenAPI document."
   }, async () => jsonText(await tracearrApi("docs")));
@@ -11736,6 +11780,7 @@ function createServer() {
   });
 
   server.registerTool("bazarr_status", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Bazarr Status",
     description: "Get Bazarr system status."
   }, async () => jsonText(await bazarrApi("system/status")));
@@ -11839,6 +11884,7 @@ function createServer() {
   }, async (input) => jsonText(await downloadBazarrMovieSubtitlesForPlex(input)));
 
   server.registerTool("bazarr_wanted_movies", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Bazarr Wanted Movies",
     description: "List Bazarr wanted movie subtitles.",
     inputSchema: {
@@ -11848,6 +11894,7 @@ function createServer() {
   }, async ({ start, length }) => jsonText(limitList(await bazarrApi("movies/wanted", { query: { start, length } }), length)));
 
   server.registerTool("bazarr_wanted_episodes", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Bazarr Wanted Episodes",
     description: "List Bazarr wanted episode subtitles.",
     inputSchema: {
@@ -11857,6 +11904,7 @@ function createServer() {
   }, async ({ start, length }) => jsonText(limitList(await bazarrApi("episodes/wanted", { query: { start, length } }), length)));
 
   server.registerTool("bazarr_providers", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Bazarr Providers",
     description: "List Bazarr subtitle providers."
   }, async () => jsonText(await bazarrApi("providers")));
@@ -11891,6 +11939,7 @@ function createServer() {
   registerServarrConfigTools(server, "radarr", "Radarr");
 
   server.registerTool("sonarr_list_series", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr List Series",
     description: "List Sonarr series, optionally filtering by a title substring.",
     inputSchema: {
@@ -11907,6 +11956,7 @@ function createServer() {
   });
 
   server.registerTool("sonarr_lookup_series", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Lookup Series",
     description: "Search Sonarr's metadata providers for a TV series before adding it.",
     inputSchema: {
@@ -11948,6 +11998,7 @@ function createServer() {
   });
 
   server.registerTool("sonarr_queue", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Queue",
     description: "List current Sonarr queue records.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
@@ -11971,6 +12022,7 @@ function createServer() {
   });
 
   server.registerTool("sonarr_manual_import_candidates", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Manual Import Candidates",
     description: "Find Sonarr manual import candidates for an exact queue item ID or path, excluding library-file rows that are outside the queue/download folder.",
     inputSchema: {
@@ -12152,6 +12204,7 @@ function createServer() {
   });
 
   server.registerTool("sonarr_profiles", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Profiles",
     description: "List Sonarr quality profiles and root folders."
   }, async () => {
@@ -12162,6 +12215,7 @@ function createServer() {
   });
 
   server.registerTool("sonarr_wanted_missing", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Wanted Missing",
     description: "List Sonarr wanted missing episode records with safe page/pageSize or offset/limit pagination.",
     inputSchema: arrWantedPaginationSchema
@@ -12175,6 +12229,7 @@ function createServer() {
   }, async (input) => jsonText(await sonarrWantedMissingIds(input)));
 
   server.registerTool("sonarr_cutoff_unmet", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Cutoff Unmet",
     description: "List Sonarr cutoff-unmet episode records.",
     inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
@@ -12187,12 +12242,14 @@ function createServer() {
   }, async ({ limit }) => jsonText(await arrRecentHistory("sonarr", limit)));
 
   server.registerTool("sonarr_blocklist", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Blocklist",
     description: "List recent Sonarr blocklist records.",
     inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
   }, async ({ limit }) => jsonText(await arrBlocklist("sonarr", limit)));
 
   server.registerTool("sonarr_command_status", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Sonarr Command Status",
     description: "List Sonarr command status records, one exact command ID, or a compact summary keyed by multiple command IDs.",
     inputSchema: {
@@ -12307,7 +12364,7 @@ function createServer() {
   server.registerTool("sonarr_subtitle_replacement_candidates_async", {
     title: "Async Sonarr Subtitle Replacement Search",
     description: "Start or poll a longer-running asynchronous Sonarr subtitle replacement candidate search with partial results, indexer filtering, and status polling so large searches do not time out the MCP request.",
-    annotations: { destructiveHint: false, readOnlyHint: true },
+    annotations: { destructiveHint: false, readOnlyHint: false, idempotentHint: false },
     inputSchema: {
       jobId: z.string().min(1).optional(),
       episodeId: z.number().int().positive().optional(),
@@ -12421,6 +12478,7 @@ function createServer() {
   }, async ({ limit }) => jsonText(await arrRecentLogs("sonarr", limit)));
 
   server.registerTool("radarr_list_movies", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr List Movies",
     description: "List Radarr movies, optionally filtering by title substring.",
     inputSchema: {
@@ -12437,6 +12495,7 @@ function createServer() {
   });
 
   server.registerTool("radarr_lookup_movie", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Lookup Movie",
     description: "Search Radarr's metadata providers for a movie before adding it.",
     inputSchema: {
@@ -12478,6 +12537,7 @@ function createServer() {
   });
 
   server.registerTool("radarr_queue", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Queue",
     description: "List current Radarr queue records.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(50) }
@@ -12501,6 +12561,7 @@ function createServer() {
   });
 
   server.registerTool("radarr_manual_import_candidates", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Manual Import Candidates",
     description: "Find Radarr manual import candidates for an exact queue item ID or path, excluding library-file rows that are outside the queue/download folder.",
     inputSchema: {
@@ -12583,6 +12644,7 @@ function createServer() {
   });
 
   server.registerTool("radarr_profiles", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Profiles",
     description: "List Radarr quality profiles and root folders."
   }, async () => {
@@ -12593,6 +12655,7 @@ function createServer() {
   });
 
   server.registerTool("radarr_wanted_missing", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Wanted Missing",
     description: "List Radarr wanted missing movie records with safe page/pageSize or offset/limit pagination.",
     inputSchema: arrWantedPaginationSchema
@@ -12606,6 +12669,7 @@ function createServer() {
   }, async (input) => jsonText(await radarrWantedMissingIds(input)));
 
   server.registerTool("radarr_cutoff_unmet", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Cutoff Unmet",
     description: "List Radarr cutoff-unmet movie records.",
     inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
@@ -12618,12 +12682,14 @@ function createServer() {
   }, async ({ limit }) => jsonText(await arrRecentHistory("radarr", limit)));
 
   server.registerTool("radarr_blocklist", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Blocklist",
     description: "List recent Radarr blocklist records.",
     inputSchema: { limit: z.number().int().min(1).max(100).default(25) }
   }, async ({ limit }) => jsonText(await arrBlocklist("radarr", limit)));
 
   server.registerTool("radarr_command_status", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "Radarr Command Status",
     description: "List Radarr command status records, one exact command ID, or a compact summary keyed by multiple command IDs.",
     inputSchema: {
@@ -12821,6 +12887,7 @@ function createServer() {
   }, async ({ limit }) => jsonText(await prowlarrIndexerHealth(limit)));
 
   server.registerTool("qbittorrent_list_torrents", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "qBittorrent List Torrents",
     description: "List qBittorrent torrents with optional filter, category, tag, and text sort.",
     inputSchema: {
@@ -12910,11 +12977,13 @@ function createServer() {
   }, async ({ hashes, dryRun }) => jsonText(await qbitTorrentHashAction("reannounce", hashes, dryRun)));
 
   server.registerTool("nzbget_status", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "NZBGet Status",
     description: "Get NZBGet server status."
   }, async () => jsonText(await nzbgetRpc("status")));
 
   server.registerTool("nzbget_list_queue", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "NZBGet Queue",
     description: "List NZBGet queue groups.",
     inputSchema: { limit: z.number().int().min(1).max(250).default(100) }
@@ -12939,6 +13008,7 @@ function createServer() {
   }, async (input) => jsonText(await nzbgetHistoryDetail(input)));
 
   server.registerTool("nzbget_download_files", {
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     title: "NZBGet Download Files",
     description: "List files NZBGet exposes for one exact history or queue item, including archive-file detection.",
     inputSchema: {
@@ -13044,6 +13114,34 @@ function createServer() {
     description: "Set the NZBGet download rate in KB/s. Use 0 for unlimited.",
     inputSchema: { rateKb: z.number().int().min(0) }
   }, async ({ rateKb }) => jsonText(await nzbgetRpc("rate", [rateKb])));
+
+  server.registerTool("seerr_public_search_media", {
+    title: "Public Seerr Catalog Search",
+    description: "Search the public movie/TV catalog for recommendations or title matching. Returns titles, synopses, release dates, genres and ratings; excludes local requests, requester identities, viewing data and service details. Catalog IDs can be used with seerr_public_media_details.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    inputSchema: {
+      query: z.string().min(1).max(300),
+      page: z.number().int().min(1).max(500).default(1)
+    }
+  }, async ({ query, page }) => {
+    const result = await seerrApi("search", { query: { query, page } });
+    return jsonText({
+      page: publicInteger(result.page || page),
+      totalPages: publicInteger(result.totalPages),
+      totalResults: publicInteger(result.totalResults),
+      results: (Array.isArray(result.results) ? result.results : []).slice(0, 100).map(record => publicCatalogMedia(record)).filter(Boolean)
+    });
+  });
+
+  server.registerTool("seerr_public_media_details", {
+    title: "Public Seerr Movie Or TV Details",
+    description: "Read public catalog metadata for an exact movie or TV TMDB ID: synopsis, genres, rating, release year and runtime or episode counts. Useful for recommendations and explaining a title. Does not return local requests, requesters, viewing history or account data.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    inputSchema: {
+      mediaType: z.enum(["movie", "tv"]),
+      tmdbId: z.number().int().positive()
+    }
+  }, async ({ mediaType, tmdbId }) => jsonText(publicCatalogMedia(await seerrApi(`${mediaType}/${tmdbId}`), mediaType)));
 
   server.registerTool("seerr_search_media", {
     title: "Seerr Search Media",

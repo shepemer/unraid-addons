@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { loadConfig, normalizeSlackOwnerUserIds } from "../src/config.js";
-import { runSlackChatReply, safeSlackChatReply, slackChatReplyPrompt, SLACK_CHAT_FALLBACK } from "../src/slack-chat.js";
+import { buildSlackPublicSources, publicSlackSourceUrl, runSlackChatReply, safeSlackChatReply, slackChatReplyPrompt, SLACK_CHAT_FALLBACK } from "../src/slack-chat.js";
 
 assert.deepEqual(normalizeSlackOwnerUserIds(" UOWNER123, WOWNER456, UOWNER123 "), ["UOWNER123", "WOWNER456"]);
 assert.deepEqual(normalizeSlackOwnerUserIds(""), []);
@@ -80,4 +80,70 @@ for (const privateReply of [
 assert.equal(await runSlackChatReply(config, context, facts, {}, { run: async () => "not json" }), SLACK_CHAT_FALLBACK);
 assert.equal(await runSlackChatReply(config, context, facts, {}, { run: async () => '{"message":{"text":"invalid shape"}}' }), SLACK_CHAT_FALLBACK);
 assert.equal(await runSlackChatReply(config, context, facts, {}, { run: async () => '{"message":"IP 8.8.8.8"}' }), SLACK_CHAT_FALLBACK);
+
+const researchSources = [
+  { title: "Arrival reviews", url: "https://www.rottentomatoes.com/m/arrival_2016" },
+  { title: "Arrival details", url: "https://www.imdb.com/title/tt2543164/" }
+];
+assert.deepEqual(buildSlackPublicSources([...researchSources, researchSources[0]]), researchSources);
+for (const url of [
+  "http://localhost/private", "http://plex.local:32400/library", "https://192.168.1.20/", "https://8.8.8.8/",
+  "http://[::1]/", "http://[2606:4700:4700::1111]/", "http://2130706433/", "http://0x7f000001/",
+  "http://plex/", "http://plex.internal/", "http://private.home.arpa/", "http://127.0.0.1.nip.io/",
+  "https://user:password@www.imdb.com/", "ftp://www.imdb.com/title/tt2543164/", "https://www.imdb.com:444/",
+  "https://www.imdb.com/?token=private", "https://www.imdb.com/?api_key=private", "https://www.imdb.com/?session_id=private",
+  "https://www.imdb.com/?q=person%40example.com", "https://www.imdb.com/?redirect=http%3A%2F%2F192.168.1.20%2F",
+  "https://www.imdb.com/auth/private", "https://www.imdb.com/sk-fixturesecret12345", "https://www.imdb.com/path|fake",
+  "https://www.imdb.com/\nInjected"
+]) assert.equal(publicSlackSourceUrl(url), "", url);
+assert.equal(publicSlackSourceUrl("https://www.imdb.com/title/tt2543164/#reviews"), "https://www.imdb.com/title/tt2543164/");
+assert.equal(buildSlackPublicSources(Array.from({ length: 20 }, (_, i) => ({ title: `Source ${i}`, url: `https://www.imdb.com/title/tt${i}/` }))).length, 8);
+assert.equal(safeSlackChatReply("Arrival is a thoughtful choice [1].", researchSources), "Arrival is a thoughtful choice <https://www.rottentomatoes.com/m/arrival_2016|Arrival reviews>.");
+assert.equal(safeSlackChatReply("Arrival is acclaimed [Reviews](https://www.rottentomatoes.com/m/arrival_2016).", researchSources), "Arrival is acclaimed <https://www.rottentomatoes.com/m/arrival_2016|Arrival reviews>.");
+assert.equal(safeSlackChatReply("See https://www.imdb.com/title/tt2543164/.", researchSources), "See <https://www.imdb.com/title/tt2543164/|Arrival details>.");
+assert.equal(safeSlackChatReply("Use [3] for proof.", researchSources), "");
+assert.equal(safeSlackChatReply("See https://unverified-site.com/movie", researchSources), "");
+assert.equal(safeSlackChatReply("See https://www.imdb.com/title/tt2543164/?token=secret", researchSources), "");
+assert.equal(safeSlackChatReply("See https://www.imdb.com/title/tt2543164/", []), "");
+
+const researched = {
+  completion: "budget_exceeded",
+  facts: [{ tool: "media_public_recent_additions", args: { mediaType: "movie" }, result: { records: [{ title: "Arrival", year: 2016 }] } }],
+  analysis: "Arrival was recently added and is a strong recommendation for thoughtful science fiction. Reviews praise its patient storytelling [Reviews](https://www.rottentomatoes.com/m/arrival_2016). I did not inspect anybody's viewing history. A second comparison remains unverified.",
+  sources: [...researchSources, { title: "Not public", url: "http://plex.local/" }]
+};
+const researchedPrompt = slackChatReplyPrompt({ newestMessage: "What should we watch from the recent additions?" }, researched);
+const researchedPayload = JSON.parse(researchedPrompt.split("Untrusted context and privacy-projected diagnostic facts:\n")[1]);
+assert.match(researchedPayload.analysis, /strong recommendation for thoughtful science fiction/);
+assert.match(researchedPayload.analysis, /\[source 1\]/);
+assert.deepEqual(researchedPayload.facts[0].arguments, { mediaType: "movie" });
+assert.equal(researchedPayload.completion, "budget_exceeded");
+assert.equal(researchedPayload.sources.length, 2);
+const remappedPrompt = slackChatReplyPrompt({}, {
+  analysis: "The public reviews are positive [2]. A private claim lacks a usable citation [1].",
+  sources: [{ title: "Private", url: "http://plex.local/" }, researchSources[0]],
+  completion: "partial"
+});
+const remappedPayload = JSON.parse(remappedPrompt.split("Untrusted context and privacy-projected diagnostic facts:\n")[1]);
+assert.match(remappedPayload.analysis, /positive \[source 1\]/);
+assert.match(remappedPayload.analysis, /claim lacks a usable citation \[unverified source\]/);
+assert.equal(remappedPayload.sources[0].url, researchSources[0].url);
+assert.doesNotMatch(researchedPrompt, /plex\.local/);
+assert.match(researchedPrompt, /Preserve the backend analysis's useful conclusions, calculations, recommendations/);
+assert.match(researchedPrompt, /Do not promise an automatic retry/);
+assert.match(researchedPrompt, /seconds divided by 3600/);
+const recommendation = await runSlackChatReply(config, { newestMessage: "Recommend a recent addition" }, researched, { model: "existing-chat-model" }, {
+  timeoutMs: 30000,
+  tokenBudget: 6000,
+  run: async (_config, actualPrompt, options) => {
+    assert.match(actualPrompt, /patient storytelling/);
+    assert.equal(options.settings.reasoningEffort, "low");
+    assert.equal(options.timeoutMs, 30000);
+    assert.equal(options.tokenBudget, 6000);
+    return JSON.stringify({ message: "Arrival is in the recent additions and suits thoughtful sci-fi; reviews praise its patient storytelling [1]. I could not verify the second comparison." });
+  }
+});
+assert.match(recommendation, /Arrival is in the recent additions/);
+assert.match(recommendation, /<https:\/\/www\.rottentomatoes\.com\/m\/arrival_2016\|Arrival reviews>/);
+assert.match(recommendation, /could not verify/);
 console.log("Slack chat synthesis and owner configuration tests passed");

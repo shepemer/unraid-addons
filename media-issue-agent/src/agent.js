@@ -72,6 +72,7 @@ import {
   runCodexSlackIntent,
   runCodexSlackChat,
   runCodexSlackPlanSummary,
+  SLACK_RESEARCH_LIMITS,
   runCodexWorkflowImprovementAnalysis,
   steeredInvestigationPrompt
 } from "./codex.js";
@@ -3184,6 +3185,9 @@ export class MediaIssueAgent {
 
   async slackReadOnlyChat(context, metadata = {}) {
     await this.init();
+    if (context.request?.researchComplexity === "excessive") {
+      return { kind: "research_scope", message: "That would exceed a short chat investigation. Narrow it to a few titles, one specific question, or a smaller time period and I can give you a useful answer within the research budget." };
+    }
     await validateCodexHome(this.config.codexHome);
     const settings = this.codexSettings().effective;
     const issue = metadata.slackIssueId ? slackIssueForId(this.config.dbPath, metadata.slackIssueId) : null;
@@ -3192,14 +3196,28 @@ export class MediaIssueAgent {
       // Keep the issue's title/scope even when the newest message is just "check again".
       ...(issue ? { trackedIssue: true, issue: { mediaTitle: issue.mediaTitle, description: issue.description } } : {})
     };
-    const facts = await this.slackDiagnosticRunner(this.config, scopedContext, settings, {
-      callTool: (name, args) => this.client.callTool(name, args),
-      onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_diagnostics", settings })
-    });
-    const message = await this.slackReplyRunner(this.config, scopedContext, facts, settings, {
-      onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_chat_reply", settings })
-    });
-    return { kind: "media_diagnostic", message };
+    const deadline = Date.now() + SLACK_RESEARCH_LIMITS.totalTimeoutMs;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort("Chat research budget reached"), SLACK_RESEARCH_LIMITS.totalTimeoutMs);
+    try {
+      const facts = await this.slackDiagnosticRunner(this.config, scopedContext, settings, {
+        listTools: options => this.client.listTools?.(options) || [],
+        callTool: (name, args, options) => this.client.callTool(name, args, options),
+        abortSignal: controller.signal,
+        onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_diagnostics", settings })
+      });
+      const message = await this.slackReplyRunner({ ...this.config, codexTerminationGraceMs: 100 }, scopedContext, facts, settings, {
+        abortSignal: controller.signal,
+        timeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())), tokenBudget: 6000,
+        onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_chat_reply", settings })
+      });
+      return { kind: "media_diagnostic", message };
+    } catch (error) {
+      this.diagnostic("warn", "slack_research_incomplete", { threadId: metadata.threadId, error: error.message });
+      return { kind: "media_diagnostic", message: "I couldn’t finish this within the chat research budget. Try a narrower question or fewer titles. No repair was started." };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async slackIssueStatus(issueId) {

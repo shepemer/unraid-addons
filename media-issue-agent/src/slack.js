@@ -196,13 +196,15 @@ export function parseSlackIssueControl(value) {
 }
 
 function isSlackIssueStatusQuestion(value) {
-  const text = stripSlackMentions(value).toLowerCase();
-  return /^(?:what(?:'s| is)(?: the)? status|(?:any|an) updates?|status (?:of|on) (?:the |this |my )?(?:issue|ticket|repair)|how(?:'s| is) (?:it|the (?:repair|investigation)) going)\b/.test(text);
+  const text = stripSlackMentions(value).toLowerCase().replace(/[.!?]+$/, "").trim();
+  // Only short workflow questions bypass classification. A leading "status"
+  // must not swallow a research question about another subject in this thread.
+  return /^(?:what(?:'s| is)(?: the)? status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|(?:any|an) updates?(?: (?:on|about|for) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|status(?: (?:of|on) (?:the |this |my |our )?(?:issue|ticket|repair|investigation))?|how(?:'s| is) (?:it|(?:the |this |my |our )?(?:repair|investigation)) going)$/.test(text);
 }
 
 function asksForIssueExplanation(value) {
   const text = stripSlackMentions(value).toLowerCase();
-  return /\b(?:more (?:info(?:rmation)?|details)|what does (?:that|this) mean|is it downloaded|can you (?:resolve|fix|check|investigate)|try harder|why|what(?:'s| is) (?:happening|going on))\b/.test(text)
+  return /\b(?:more (?:info(?:rmation)?|details)|what does (?:that|this) mean|what (?:did you find|have you found)|findings|next (?:diagnostic |repair )?steps|is it downloaded|can you (?:resolve|fix|check|investigate)|try harder|why|what(?:'s| is) (?:happening|going on))\b/.test(text)
     || /^(?:ok(?:ay)?[, ]+)?(?:do that|check that|look into it)[.!?]*$/.test(text);
 }
 
@@ -354,6 +356,7 @@ export function parseSlackIntentResult(output) {
   const result = {
     intent,
     confidence,
+    ...(parsed.researchComplexity === "excessive" ? { researchComplexity: "excessive" } : {}),
     ...(intent === "issue_control" ? { issueAction: ["steer", "reinvestigate"].includes(parsed.issueAction) ? parsed.issueAction : "steer" } : {}),
     mediaTitle: compact(redactText(stripSlackMentions(parsed.mediaTitle)), 160),
     description: compact(redactText(stripSlackMentions(parsed.description)), 1200),
@@ -1585,7 +1588,11 @@ export class SlackService {
     }
 
     if (item.slackIssueId && result.intent === "issue_status") {
-      await this.replyWithIssueStatus(item);
+      if (asksForIssueExplanation(item.text)) {
+        await this.replyWithReadOnlyChat(item, result, context);
+      } else {
+        await this.replyWithIssueStatus(item);
+      }
       return;
     }
 

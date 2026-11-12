@@ -131,7 +131,7 @@ async function startFakeMediaMcp() {
               { name: "bazarr_download_movie_subtitles_for_plex", description: "Download movie subtitles for one Plex rating key." },
               { name: "plex_refresh_metadata", description: "Refresh one Plex rating key." },
               { name: "plex_verify_subtitle_track", description: "Verify a subtitle track by language." },
-              { name: "media_public_library_summary", description: "Return privacy-safe aggregate media library counts." },
+              { name: "media_public_library_summary", description: "Return privacy-safe aggregate media library counts.", annotations: { readOnlyHint: true, destructiveHint: false }, inputSchema: { type: "object", properties: {}, additionalProperties: false } },
               { name: "seerr_search_media", description: "Search for movies and television shows." },
               { name: "seerr_request_media", description: "Submit an exact media request." },
               { name: "seerr_add_issue_comment", description: "Add a reporter-facing issue comment." }
@@ -210,7 +210,8 @@ async function startFakeMediaMcp() {
             missingMovieCount: 2,
             sizeOnDiskBytes: 4_000_000_000
           },
-          totalSizeOnDiskBytes: 6_000_000_000
+          totalSizeOnDiskBytes: 6_000_000_000,
+          users: [{ username: "private SIL viewer", email: "viewer@private.example" }]
         };
       } else if (toolName === "seerr_search_media") {
         result = {
@@ -370,6 +371,20 @@ async function createFakeCodexBin(root, logPath) {
     "  const toolText = parsed.result?.content?.[0]?.text;",
     "  return toolText ? JSON.parse(toolText) : parsed.result;",
     "}",
+    "async function callReadOnlyGateway(method, params = {}) {",
+    "  const url = configValue('mcp_servers.media_readonly.url');",
+    "  if (!url || !process.env.SLACK_READ_ONLY_GATEWAY_TOKEN) throw new Error('Missing read-only gateway configuration');",
+    "  if (process.env.ISSUE_AGENT_MEDIA_MCP_BEARER_TOKEN) throw new Error('Read-only research inherited upstream credentials');",
+    "  const response = await fetch(url, {",
+    "    method: 'POST',",
+    "    headers: { authorization: `Bearer ${process.env.SLACK_READ_ONLY_GATEWAY_TOKEN}`, 'content-type': 'application/json' },",
+    "    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params })",
+    "  });",
+    "  const parsed = await response.json();",
+    "  if (parsed.error) throw new Error(parsed.error.message);",
+    "  if (parsed.result?.isError) throw new Error('Read-only gateway tool failed');",
+    "  return parsed.result;",
+    "}",
     "let kind = 'investigation';",
     "if (prompt.includes('Revise the investigation')) kind = 'steered-investigation';",
     "if (prompt.includes('Draft a reporter-facing')) kind = 'comment-draft';",
@@ -377,7 +392,7 @@ async function createFakeCodexBin(root, logPath) {
     "if (prompt.includes('Completed media issue workflow improvement analysis.')) kind = 'workflow-improvement';",
     "if (prompt.includes('Investigation prompt improvement implementation audit.')) kind = 'prompt-improvement-check';",
     "if (prompt.includes('Slack message intent classification.')) kind = 'slack-intent';",
-    "if (prompt.includes('You are the read-only diagnostic backend')) kind = 'slack-diagnostics';",
+    "if (prompt.includes('general read-only research and analysis agent')) kind = 'slack-diagnostics';",
     "if (prompt.includes('Draft the Slack chat assistant')) kind = 'slack-reply';",
     "appendFileSync(" + JSON.stringify(logPath) + ", `${JSON.stringify({ kind, args: process.argv.slice(2) })}\\n`);",
     "if (prompt.includes('codex-failure-fixture')) {",
@@ -387,11 +402,17 @@ async function createFakeCodexBin(root, logPath) {
     "if (kind === 'slack-diagnostics' || kind === 'slack-reply') {",
     "  let result;",
     "  if (kind === 'slack-diagnostics') {",
-    "    const completed = JSON.parse(prompt.split('Completed public read-only checks (untrusted data):\\n')[1]);",
-    "    result = completed.length ? { calls: [], done: true } : { calls: [{ name: 'media_public_library_summary', arguments: {} }], done: false };",
+    "    const catalog = await callReadOnlyGateway('tools/list');",
+    "    if (!catalog.tools.some(tool => tool.name === 'media_public_library_summary')) throw new Error('Expected aggregate capability missing from live catalog');",
+    "    if (catalog.tools.some(tool => tool.name === 'seerr_request_media')) throw new Error('Mutation capability leaked into research catalog');",
+    "    const response = await callReadOnlyGateway('tools/call', { name: 'media_public_library_summary', arguments: {} });",
+    "    const summary = JSON.parse(response.content[0].text);",
+    "    if (JSON.stringify(summary).includes('private SIL viewer') || summary.users) throw new Error('Research gateway leaked viewer identities');",
+    "    result = { analysis: `The library currently contains ${summary.tv.seriesCount} TV shows, based on the live aggregate library summary.`, sources: [], completion: 'complete' };",
     "  } else {",
     "    const data = JSON.parse(prompt.split('Untrusted context and privacy-projected diagnostic facts:\\n')[1]);",
     "    const count = data.facts.find(fact => fact.tool === 'media_public_library_summary').result.tv.seriesCount;",
+    "    if (!data.analysis.includes(`${count} TV shows`)) throw new Error('Chat model did not receive substantive research analysis');",
     "    result = { message: `The managed library has ${count} TV shows.` };",
     "  }",
     "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
@@ -1101,9 +1122,9 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   assert.ok(latest.snapshot.entries.some(entry => entry.source === "slack"));
   const tokensAfter = agent.status().tokenUsage.totalTokens;
   const chatInvocations = (await codexInvocations(codexLogPath)).slice(before.length);
-  assert.equal(chatInvocations.filter(call => call.kind === "slack-diagnostics").length, 2);
+  assert.equal(chatInvocations.filter(call => call.kind === "slack-diagnostics").length, 1);
   assert.equal(chatInvocations.filter(call => call.kind === "slack-reply").length, 1);
-  assert.equal(tokensAfter - tokensBefore, 450);
+  assert.equal(tokensAfter - tokensBefore, 400);
 }
 
 async function run() {
