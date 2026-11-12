@@ -22,6 +22,11 @@ const prompt = slackChatReplyPrompt(context, facts);
 assert.match(prompt, /20/);
 assert.match(prompt, /7200/);
 assert.match(prompt, /Never identify who watched what/);
+assert.match(prompt, /Default to about 80 words or fewer/);
+assert.match(prompt, /at most three concise bullets/);
+assert.match(prompt, /If the user explicitly asks for detail, expand only as much as needed/);
+assert.match(prompt, /Format for Slack mrkdwn: use \*bold\*/);
+assert.match(prompt, /Preserve line breaks between short paragraphs and bullet items/);
 assert.doesNotMatch(prompt, /undefined/);
 const scopedContext = {
   newestMessage: "is it downloaded?",
@@ -65,6 +70,12 @@ const message = await runSlackChatReply(config, context, facts, { model: "existi
 });
 assert.equal(calls, 1);
 assert.equal(message, "There were 20 plays and 2 hours of total watch time.");
+const formattedReply = "*Download complete; import blocked.*\n\n• The file downloaded successfully.\n• Next: approve the import repair with `approve repair`.";
+assert.equal(safeSlackChatReply(formattedReply), formattedReply);
+assert.equal(safeSlackChatReply("  *Weekly watch time*  \r\n\r\n\r\n  •  2 hours\r\n \t• 20 plays  "), "*Weekly watch time*\n\n• 2 hours\n• 20 plays");
+assert.equal(await runSlackChatReply(config, context, facts, {}, {
+  run: async () => JSON.stringify({ message: formattedReply })
+}), formattedReply);
 for (const privateReply of [
   "The file is /mnt/user/media/test.mkv",
   "Connected at 8.8.8.8",
@@ -73,7 +84,10 @@ for (const privateReply of [
   "Email person@example.com",
   "The device is plex.local",
   "Use C:\\Media\\test.mkv",
-  "API key sk-fixturesecret12345"
+  "API key sk-fixturesecret12345",
+  "*Details*\n\n• The file is /mnt/user/media/test.mkv",
+  "*Details*\n• User <@UOWNER123> watched it",
+  "*Details*\n• Contact person@example.com"
 ]) {
   assert.equal(safeSlackChatReply(privateReply), "", privateReply);
 }
@@ -105,6 +119,20 @@ assert.equal(safeSlackChatReply("Use [3] for proof.", researchSources), "");
 assert.equal(safeSlackChatReply("See https://unverified-site.com/movie", researchSources), "");
 assert.equal(safeSlackChatReply("See https://www.imdb.com/title/tt2543164/?token=secret", researchSources), "");
 assert.equal(safeSlackChatReply("See https://www.imdb.com/title/tt2543164/", []), "");
+assert.equal(safeSlackChatReply("*Try Arrival.*\n\n• Thoughtful science fiction [1].\n• Recently added to the library.", researchSources), "*Try Arrival.*\n\n• Thoughtful science fiction <https://www.rottentomatoes.com/m/arrival_2016|Arrival reviews>.\n• Recently added to the library.");
+assert.equal(safeSlackChatReply("*Recommendation*\n\n• See https://unverified-site.com/movie", researchSources), "");
+const longFormattedReply = safeSlackChatReply(`*Recommendation*\n\n• Arrival is worth watching [1].\n\n${"Additional verified context. ".repeat(100)}`, researchSources);
+assert.ok(longFormattedReply.length <= 2000);
+assert.match(longFormattedReply, /^\*Recommendation\*\n\n•/);
+assert.match(longFormattedReply, /<https:\/\/www\.rottentomatoes\.com\/m\/arrival_2016\|Arrival reviews>/);
+assert.match(longFormattedReply, /…$/);
+assert.doesNotMatch(longFormattedReply, /\[source/);
+const overflowingCitation = safeSlackChatReply(`${"Verified context. ".repeat(110)}[1]`, [
+  { title: "Long public source", url: `https://www.imdb.com/${"article".repeat(120)}` }
+]);
+assert.ok(overflowingCitation.length <= 2000);
+assert.match(overflowingCitation, /…$/);
+assert.doesNotMatch(overflowingCitation, /\[source|<|https?:\/\//);
 
 const researched = {
   completion: "budget_exceeded",

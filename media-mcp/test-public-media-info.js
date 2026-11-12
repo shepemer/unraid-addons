@@ -40,6 +40,16 @@ async function run() {
     3
   ) / 1000);
   const calls = [];
+  const periodStartDate = days => {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - (days - 1) * 86400_000).toISOString().slice(0, 10);
+  };
+  let historyOverride = null;
+  const fallbackHistoryRows = [
+    { media_type: "movie", title: "Private Watch Record", duration: 207, friendly_name: "Private User", user_id: 7001, player: "private-device" },
+    { media_type: "episode", grandparent_title: "Private Series", duration: 3600, friendly_name: "Another Private User", user_id: 7002 },
+    { media_type: "movie", title: "Private Watch Record", duration: 125, friendly_name: "Private User", user_id: 7001 }
+  ];
   const mock = http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
     calls.push({
@@ -211,6 +221,8 @@ async function run() {
             data: {
               recordsTotal: 50,
               recordsFiltered: 3,
+              total_duration: "201 days 4 hrs 30 mins",
+              filter_duration: "207 secs",
               data: [{
                 media_type: "episode",
                 grandparent_title: "Fixture Series",
@@ -236,17 +248,44 @@ async function run() {
           }
         });
       }
+      if (url.searchParams.get("search") === "Fixture Movie") {
+        assert.equal(url.searchParams.get("media_type"), "movie");
+        return sendJson(res, 200, {
+          response: {
+            result: "success",
+            data: {
+              recordsTotal: 23480,
+              recordsFiltered: 1,
+              // The upstream total ignores the global search text. The exact
+              // movie calculation must still use matching rows, not this sum.
+              total_duration: "70 days 2 hrs",
+              filter_duration: "5125 secs",
+              data: [{ media_type: "movie", title: "Fixture Movie", year: 2025, duration: 5125, friendly_name: "Private User", user_id: 7001 }]
+            }
+          }
+        });
+      }
+      const start = Number(url.searchParams.get("start"));
+      const length = Number(url.searchParams.get("length"));
+      const weekly = url.searchParams.get("after") === periodStartDate(7);
+      const moviesOnly = url.searchParams.get("media_type") === "movie";
+      const overrideRows = historyOverride?.rowCount
+        ? Array.from({ length: Math.min(length, Math.max(0, historyOverride.rowCount - start)) }, () => ({ duration: 1, media_type: "movie", friendly_name: "Private User" }))
+        : (historyOverride?.rows || fallbackHistoryRows).slice(start, start + length);
       return sendJson(res, 200, {
         response: {
           result: "success",
           data: {
-            recordsTotal: 50,
-            recordsFiltered: 5,
-            filter_duration: "4 hrs 30 mins",
-            data: [{
+            recordsTotal: 23480,
+            recordsFiltered: historyOverride?.rowCount || (historyOverride ? fallbackHistoryRows.length : weekly ? 42 : moviesOnly ? 5000 : 23480),
+            // With length=1 the page is just 207 seconds, even when thousands
+            // of filtered plays cover many days of watch time.
+            filter_duration: "3 mins 27 secs",
+            ...(historyOverride ? historyOverride.summary : { total_duration: weekly ? "14 hrs 30 mins" : moviesOnly ? "70 days 2 hrs" : "201 days 4 hrs 30 mins" }),
+            data: historyOverride ? overrideRows : [{
               media_type: "movie",
               title: "Private Watch Record",
-              duration: 1200,
+              duration: 207,
               friendly_name: "Private User"
             }]
           }
@@ -372,11 +411,34 @@ async function run() {
     assert.equal(series.result.missingEpisodeCount, 2);
     assert.equal(Object.hasOwn(series.result, "id"), false);
 
-    const aggregateWatchtime = await tool("media_public_watchtime_summary", { periodDays: 7 });
+    const aggregateWatchtime = await tool("media_public_watchtime_summary", { periodDays: 365 });
     assert.equal(aggregateWatchtime.scope, "library");
-    assert.equal(aggregateWatchtime.playCount, 5);
-    assert.equal(aggregateWatchtime.totalWatchSeconds, 16_200);
-    assert.equal(aggregateWatchtime.periodDays, 7);
+    assert.equal(aggregateWatchtime.playCount, 23480);
+    assert.equal(aggregateWatchtime.totalWatchSeconds, 201 * 86400 + 4 * 3600 + 30 * 60);
+    assert.notEqual(aggregateWatchtime.totalWatchSeconds, 207);
+    assert.equal(aggregateWatchtime.periodDays, 365);
+    assert.equal(aggregateWatchtime.complete, true);
+    const aggregateCall = calls.at(-1);
+    assert.equal(aggregateCall.query.length, "1");
+    assert.equal(aggregateCall.query.after, periodStartDate(365));
+
+    const weeklyWatchtime = await tool("media_public_watchtime_summary", { periodDays: 7 });
+    assert.equal(weeklyWatchtime.playCount, 42);
+    assert.equal(weeklyWatchtime.totalWatchSeconds, 14 * 3600 + 30 * 60);
+    assert.equal(calls.at(-1).query.after, periodStartDate(7));
+    assert.equal(weeklyWatchtime.periodStart.slice(0, 10), calls.at(-1).query.after);
+
+    const movieWatchtime = await tool("media_public_watchtime_summary", { periodDays: 365, mediaType: "movie" });
+    assert.equal(movieWatchtime.playCount, 5000);
+    assert.equal(movieWatchtime.totalWatchSeconds, 70 * 86400 + 2 * 3600);
+    assert.ok(movieWatchtime.totalWatchSeconds < aggregateWatchtime.totalWatchSeconds);
+    assert.equal(calls.at(-1).query.media_type, "movie");
+    assert.equal(calls.at(-1).query.after, periodStartDate(365));
+
+    const movieTitleWatchtime = await tool("media_public_watchtime_summary", { periodDays: 365, mediaType: "movie", title: "Fixture Movie", year: 2025 });
+    assert.equal(movieTitleWatchtime.playCount, 1);
+    assert.equal(movieTitleWatchtime.totalWatchSeconds, 5125);
+    assert.ok(movieTitleWatchtime.totalWatchSeconds < aggregateWatchtime.totalWatchSeconds);
 
     const titleWatchtime = await tool("media_public_watchtime_summary", {
       periodDays: 30,
@@ -389,6 +451,42 @@ async function run() {
     assert.equal(titleWatchtime.playCount, 2);
     assert.equal(titleWatchtime.totalWatchSeconds, 2700);
     assert.equal(titleWatchtime.complete, true);
+
+    const fallbackResults = [];
+    for (const total of [undefined, null, "", "not available", "4 hrs unavailable", "-4 hrs", "1 hr 2 milliseconds", "3 minutesgarbage", false, [], "0x100", Infinity]) {
+      historyOverride = { summary: total === undefined ? {} : { total_duration: total } };
+      const previousCalls = calls.length;
+      const fallback = await tool("media_public_watchtime_summary", { periodDays: 365 });
+      assert.equal(fallback.playCount, 3, `Invalid total ${String(total)} must use history rows`);
+      assert.equal(fallback.totalWatchSeconds, 3932);
+      assert.equal(fallback.complete, true);
+      assert.deepEqual(calls.slice(previousCalls).map(call => call.query.length), ["1", "1000"]);
+      assert.ok(calls.slice(previousCalls).every(call => call.query.after === periodStartDate(365)));
+      fallbackResults.push(fallback);
+    }
+    for (const total of [0, "0", 16200, "16200", "4 hrs 30 mins", "4 hours 30 minutes", "1 day 2 hrs 3 mins 4 secs"]) {
+      historyOverride = { summary: { total_duration: total } };
+      const previousCalls = calls.length;
+      const parsed = await tool("media_public_watchtime_summary", { periodDays: 365 });
+      assert.equal(parsed.totalWatchSeconds, total === 0 || total === "0" ? 0 : total === "1 day 2 hrs 3 mins 4 secs" ? 93784 : 16200);
+      assert.equal(calls.length, previousCalls + 1, "Valid total should not fetch raw history pages");
+    }
+    historyOverride = { summary: {}, rowCount: 1001 };
+    const paginationStart = calls.length;
+    const paginatedWatchtime = await tool("media_public_watchtime_summary", { periodDays: 365 });
+    assert.equal(paginatedWatchtime.playCount, 1001);
+    assert.equal(paginatedWatchtime.totalWatchSeconds, 1001);
+    assert.equal(paginatedWatchtime.complete, true);
+    assert.deepEqual(calls.slice(paginationStart).map(call => call.query.start), ["0", "0", "1000"]);
+    historyOverride = { summary: {}, rowCount: 50001 };
+    const boundedStart = calls.length;
+    const boundedWatchtime = await tool("media_public_watchtime_summary", { periodDays: 365 });
+    assert.equal(boundedWatchtime.playCount, 50000);
+    assert.equal(boundedWatchtime.totalWatchSeconds, 50000);
+    assert.equal(boundedWatchtime.complete, false);
+    assert.equal(calls.length - boundedStart, 51);
+    assert.equal(calls.at(-1).query.start, "49000");
+    historyOverride = null;
 
     const bandwidth = await tool("plex_public_bandwidth_summary");
     assert.equal(bandwidth.totalBytes, 3_000_000);
@@ -430,7 +528,13 @@ async function run() {
       library,
       series,
       aggregateWatchtime,
+      weeklyWatchtime,
+      movieWatchtime,
+      movieTitleWatchtime,
       titleWatchtime,
+      fallbackResults,
+      paginatedWatchtime,
+      boundedWatchtime,
       bandwidth,
       health,
       queues,
