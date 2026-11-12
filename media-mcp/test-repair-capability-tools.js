@@ -107,6 +107,8 @@ async function run() {
   const plexRoot = path.join(tempRoot, "plex-root");
   const plexTvDir = path.join(plexRoot, "tv", "Fixture Series", "Season 13");
   const plexMappedEpisodeFile = path.join(plexTvDir, "Fixture Series - S13E03.mkv");
+  const spacedTvDir = path.join(mediaRoot, "TV Shows", "Fixture Series", "Season 5");
+  const spacedEpisodeFile = path.join(spacedTvDir, "episode.mkv");
   const fakeBinDir = path.join(tempRoot, "bin");
   await mkdir(movieDir, { recursive: true });
   await mkdir(downloadsRoot, { recursive: true });
@@ -114,6 +116,7 @@ async function run() {
   await mkdir(deleteDir, { recursive: true });
   await mkdir(tvDir, { recursive: true });
   await mkdir(plexTvDir, { recursive: true });
+  await mkdir(spacedTvDir, { recursive: true });
   await mkdir(fakeBinDir, { recursive: true });
   await writeFile(movieFile, "movie fixture\n");
   await writeFile(outsideFile, "outside fixture\n");
@@ -122,6 +125,7 @@ async function run() {
   await writeFile(compareEpisodeFile, "compare fixture\n");
   await writeFile(hangingProbeFile, "hanging fixture\n");
   await writeFile(plexMappedEpisodeFile, "episode fixture\n");
+  await writeFile(spacedEpisodeFile, "spaced TV library fixture\n");
   await symlink(outsideRoot, path.join(mediaRoot, "escape-link"), "dir");
   await symlink(outsideRoot, path.join(downloadsRoot, "escape-link"), "dir");
   const fakeFfprobe = path.join(fakeBinDir, "ffprobe");
@@ -171,6 +175,23 @@ async function run() {
     if (req.method === "DELETE" && url.pathname === "/plex/library/metadata/900001") {
       return sendJson(res, 200, { deleted: true, ratingKey: "900001" });
     }
+    if (req.method === "GET" && url.pathname === "/plex/library/sections") {
+      return sendJson(res, 200, { MediaContainer: { Directory: [{ key: "1", refreshing: false }, { key: "2", refreshing: true }] } });
+    }
+    if (req.method === "GET" && url.pathname === "/plex/activities") {
+      return sendJson(res, 200, { MediaContainer: { Activity: [{ uuid: "scan-fixture", type: "library.scan", progress: 50, Context: { librarySectionID: 2 } }] } });
+    }
+    if (req.method === "GET" && url.pathname === "/plex/hubs/search") {
+      return sendJson(res, 200, { MediaContainer: { Hub: [{ type: "show", size: 3, Metadata: Array.from({ length: 3 }, (_, index) => ({ type: "show", ratingKey: `show-${index}`, title: `Show ${index}`, year: 2020, addedAt: 1794466805, summary: "long ".repeat(1000), Media: [{ Part: [{ file: "/private/file" }] }] })) }, { type: "movie", size: 1, Metadata: [{ type: "movie", ratingKey: "movie-1", title: "Movie" }] }] } });
+    }
+    if (req.method === "GET" && /\/plex\/library\/metadata\/(?:show|season)-paged\/children$/.test(url.pathname)) {
+      const start = Number(url.searchParams.get("X-Plex-Container-Start")) || 0;
+      const limit = Number(url.searchParams.get("X-Plex-Container-Size")) || 100;
+      const season = url.pathname.includes("show-paged");
+      const records = Array.from({ length: 3 }, (_, index) => ({ type: season ? "season" : "episode", ratingKey: `${season ? "season" : "episode"}-${index}`, index: index + 1, parentIndex: season ? undefined : 5, leafCount: season ? 10 : undefined, addedAt: 1794466805 + index, updatedAt: 1794466905 + index }));
+      const page = records.slice(start, start + limit);
+      return sendJson(res, 200, { MediaContainer: { totalSize: 3, Metadata: page, Directory: season ? page : [] } });
+    }
     if (req.method === "GET" && url.pathname === "/plex/library/metadata/season-13/children") {
       return sendJson(res, 200, {
         MediaContainer: {
@@ -183,6 +204,8 @@ async function run() {
             title: "Building Fixture",
             parentIndex: 13,
             index: 3,
+            addedAt: 1794466805,
+            updatedAt: 1794466905,
             Media: [{
               id: 501,
               videoResolution: "1080",
@@ -211,6 +234,8 @@ async function run() {
             parentTitle: "Fixture Series",
             parentRatingKey: "show-55",
             index: 13,
+            addedAt: 1794466805,
+            updatedAt: 1794466905,
             librarySectionID: "2",
             librarySectionTitle: "TV",
             leafCount: 12,
@@ -240,7 +265,7 @@ async function run() {
         }
       });
     }
-    if (req.method === "PUT" && url.pathname === "/plex/library/sections/2/refresh") {
+    if (req.method === "POST" && url.pathname === "/plex/library/sections/2/refresh") {
       assert.deepEqual(Object.fromEntries(url.searchParams), { path: "/tv/Fixture Series/Season 13" });
       return sendJson(res, 200, { refreshed: true, sectionKey: "2" });
     }
@@ -250,7 +275,7 @@ async function run() {
     if (req.method === "PUT" && url.pathname === "/plex/library/metadata/episode-1301/analyze") {
       return sendJson(res, 200, { analyzed: true, ratingKey: "episode-1301" });
     }
-    if (req.method === "PUT" && url.pathname === "/plex/library/sections/1/refresh") {
+    if (req.method === "POST" && url.pathname === "/plex/library/sections/1/refresh") {
       assert.deepEqual(Object.fromEntries(url.searchParams), { path: "/movies/Fixture Movie (2026)" });
       return sendJson(res, 200, { refreshed: true, sectionKey: "1" });
     }
@@ -598,6 +623,8 @@ async function run() {
     assert.equal(seasonChildren.total, 1);
     assert.equal(seasonChildren.children[0].ratingKey, "episode-1301");
     assert.equal(seasonChildren.children[0].parts[0].file, "/tv/Fixture Series/Season 13/Fixture Series - S13E03.mkv");
+    assert.equal(seasonChildren.children[0].addedAt, 1794466805);
+    assert.equal(seasonChildren.children[0].updatedAt, 1794466905);
 
     const showSeasons = await tool("plex_list_show_seasons", {
       ratingKey: "show-55"
@@ -605,6 +632,25 @@ async function run() {
     assert.equal(showSeasons.total, 1);
     assert.equal(showSeasons.seasons[0].ratingKey, "season-13");
     assert.equal(showSeasons.seasons[0].childCount, 12);
+    assert.equal(showSeasons.seasons[0].addedAt, 1794466805);
+    assert.equal(showSeasons.seasons[0].updatedAt, 1794466905);
+    const pagedSeasons = await tool("plex_list_show_seasons", { ratingKey: "show-paged", offset: 1, limit: 1 });
+    assert.equal(pagedSeasons.totalSize, 3);
+    assert.equal(pagedSeasons.returned, 1, "Directory and Metadata duplicates must not double count seasons");
+    assert.equal(pagedSeasons.nextOffset, 2);
+    assert.equal(pagedSeasons.complete, false);
+    assert.equal(pagedSeasons.seasons[0].index, 2);
+    const finalEpisodes = await tool("plex_list_season_children", { ratingKey: "season-paged", offset: 2, limit: 1 });
+    assert.equal(finalEpisodes.totalSize, 3);
+    assert.equal(finalEpisodes.complete, true);
+    assert.equal(finalEpisodes.nextOffset, null);
+    assert.equal(finalEpisodes.children[0].index, 3);
+    const search = await tool("plex_search", { query: "Show", limit: 2 });
+    assert.equal(search.MediaContainer.returnedRecords, 2);
+    assert.equal(search.MediaContainer.Hub[0].Metadata.length, 2);
+    assert.equal(search.MediaContainer.Hub[0].Metadata[0].addedAt, 1794466805);
+    assert.equal(search.MediaContainer.truncated, true);
+    assert.doesNotMatch(JSON.stringify(search), /private\/file|long long/);
 
     const plexScanDry = await tool("plex_scan_library_path", {
       ratingKey: "episode-1301",
@@ -613,6 +659,7 @@ async function run() {
     });
     assert.equal(plexScanDry.dryRun, true);
     assert.deepEqual(plexScanDry.actions.map(action => action.type), ["scan_path", "refresh_metadata", "analyze_metadata"]);
+    assert.equal(plexScanDry.actions[0].method, "POST");
     assert.equal(plexScanDry.paths[0], "/tv/Fixture Series/Season 13");
 
     const plexScanRun = await tool("plex_scan_library_path", {
@@ -622,7 +669,14 @@ async function run() {
     });
     assert.equal(plexScanRun.ok, true);
     assert.deepEqual(plexScanRun.results.map(result => result.action), ["scan_path", "refresh_metadata", "analyze_metadata"]);
+    assert.equal(plexScanRun.scanStatus.state, "running");
+    assert.equal(plexScanRun.completionVerified, false);
+    const scanAlias = await tool("plex_scan_section_path", { sectionKey: "2", path: "/tv/Fixture Series/Season 13" });
+    assert.equal(scanAlias.dryRun, true);
 
+    const spacedProbe = await tool("media_probe_video_content", { path: "/data/TV Shows/Fixture Series/Season 5/episode.mkv" });
+    assert.equal(spacedProbe.file.size, Buffer.byteLength("spaced TV library fixture\n"));
+    assert.equal(spacedProbe.ffprobe.code, 0, "Plex /data/TV Shows paths must resolve through configured media roots");
     const probe = await tool("media_probe_video_content", {
       ratingKey: "episode-1301",
       includeFrameHashes: true,
@@ -687,6 +741,10 @@ async function run() {
       dryRun: false
     });
     assert.equal(plexScanned.result.refreshed, true);
+    assert.equal(plexScanned.scanRequest.accepted, true);
+    assert.equal(plexScanned.scanRequest.method, "POST");
+    assert.equal(plexScanned.scanStatus.state, "idle");
+    assert.equal(plexScanned.scanStatus.completionVerified, false);
 
     const plexTrash = await tool("plex_delete_metadata", {
       operation: "empty_trash",

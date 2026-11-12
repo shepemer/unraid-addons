@@ -156,6 +156,11 @@ async function run() {
     size: 123
   }];
   let qbitAddCount = 0;
+  let qbitPendingMode = false;
+  let replacementSearchStatus = "completed";
+  let lateReplacementMode = false;
+  let replacementCommandReads = 0;
+  let lateReplacementPending = false;
   function sonarrWantedEpisode(id, overrides = {}) {
     return {
       id,
@@ -519,9 +524,11 @@ async function run() {
         return sendJson(res, 200, qbitTorrents);
       }
       if (req.method === "POST" && qbitPath === "torrents/add") {
+        if (qbitPendingMode) return sendJson(res, 202, { added_torrent_ids: [], failure_count: 0, pending_count: 1, success_count: 0 });
         qbitAddCount += 1;
+        const addedHash = String(qbitAddCount).padStart(40, "0");
         qbitTorrents.push({
-          hash: `fixture-qbit-hash-${qbitAddCount}`,
+          hash: addedHash,
           name: "Show.S01.MULTi.1080p.WEB-DL-GRP",
           category: form.category,
           tags: form.tags,
@@ -529,8 +536,7 @@ async function run() {
           progress: 0,
           size: 456
         });
-        res.writeHead(200, { "content-type": "text/plain" });
-        return res.end("Ok.");
+        return sendJson(res, 200, { added_torrent_ids: [addedHash], failure_count: 0, pending_count: 0, success_count: 1 });
       }
       return sendJson(res, 404, { error: `unexpected qbit ${req.method} ${qbitPath}` });
     }
@@ -649,6 +655,7 @@ async function run() {
       });
     }
     if (req.method === "GET" && path === "command") {
+      if (service === "sonarr" && lateReplacementMode && ++replacementCommandReads === 2) lateReplacementPending = true;
       return sendJson(res, 200, [...commandRecords.values()]);
     }
     if (req.method === "GET" && path.startsWith("command/")) {
@@ -788,6 +795,9 @@ async function run() {
     }
     if (req.method === "POST" && path === "history/failed/5001") {
       historyFailedCallCount += 1;
+      replacementCommandReads = 0;
+      const replacementCommand = { id: ++commandId, name: "EpisodeSearch", status: replacementSearchStatus, body: { name: "EpisodeSearch", episodeIds: [101] } };
+      commandRecords.set(replacementCommand.id, replacementCommand);
       if (historyFailedCallCount >= 2) {
         sonarrQueue.push(
           {
@@ -868,6 +878,10 @@ async function run() {
       return sendJson(res, 200, body);
     }
     if (req.method === "GET" && path === "queue/details") {
+      if (service === "sonarr" && lateReplacementPending) {
+        lateReplacementPending = false;
+        sonarrQueue.push({ id: 54321, title: "Late replacement", seriesId: 10, episodeId: 101, episodes: [{ id: 101 }], downloadId: "late", status: "downloading" });
+      }
       return sendJson(res, 200, queueForService(service));
     }
     if (req.method === "DELETE" && path.startsWith("queue/")) {
@@ -1467,7 +1481,7 @@ async function run() {
       dryRun: false
     });
     assert.equal(qbitAdd.added, true);
-    assert.equal(qbitAdd.trackedDownloadId, "fixture-qbit-hash-1");
+    assert.equal(qbitAdd.trackedDownloadId, "1".padStart(40, "0"));
     assert.equal(qbitAdd.torrent.category, "sonarr");
     assert.doesNotMatch(JSON.stringify(qbitAdd), /secret-token|"downloadUrl"|https:\/\/example/);
     const qbitAddCall = calls.findLast(call => call.service === "qbittorrent" && call.path === "torrents/add");
@@ -1487,8 +1501,14 @@ async function run() {
     assert.equal(sonarrProwlarrFallback.grabbed, true);
     assert.equal(sonarrProwlarrFallback.grabbedBy, "qbittorrent");
     assert.match(sonarrProwlarrFallback.sonarrError, /release in cache/i);
-    assert.equal(sonarrProwlarrFallback.qbittorrent.trackedDownloadId, "fixture-qbit-hash-2");
+    assert.equal(sonarrProwlarrFallback.qbittorrent.trackedDownloadId, "2".padStart(40, "0"));
     assert.doesNotMatch(JSON.stringify(sonarrProwlarrFallback), /secret-token|"downloadUrl"|https:\/\/example/);
+    qbitPendingMode = true;
+    const pendingUrl = await tool("qbittorrent_add_prowlarr_release", { release: prowlarrRelease, dryRun: false });
+    assert.equal(pendingUrl.added, false);
+    assert.equal(pendingUrl.pending, true);
+    assert.equal(pendingUrl.trackedDownloadId, null, "matching title and unrelated new torrents do not prove this URL was added");
+    qbitPendingMode = false;
 
     const movieSubtitleCandidates = await tool("radarr_subtitle_replacement_candidates", {
       movieIds: [401],
@@ -1660,6 +1680,18 @@ async function run() {
       blocklist: "true",
       skipRedownload: "true"
     });
+    replacementSearchStatus = "started";
+    const delayedSearchSuppression = await tool("sonarr_blocklist_history_without_retry", { seriesId: 10, episodeIds: [101], sourceTitle: "Show.S01E01.1080p-GRP", settleMs: 0, dryRun: false });
+    assert.equal(delayedSearchSuppression.replacementSuppressed, false);
+    assert.equal(delayedSearchSuppression.verification.status, "incomplete", "an empty queue before a search finishes must not count as suppression success");
+    assert.equal(delayedSearchSuppression.verification.searchCommands.length, 1);
+    replacementSearchStatus = "completed";
+    lateReplacementMode = true;
+    const lateSuppression = await tool("sonarr_blocklist_history_without_retry", { seriesId: 10, episodeIds: [101], sourceTitle: "Show.S01E01.1080p-GRP", settleMs: 0, dryRun: false });
+    assert.equal(lateSuppression.replacementSuppressed, false, "a replacement first observed in the final queue fetch must not be ignored");
+    assert.equal(lateSuppression.verification.status, "failed");
+    assert.ok(lateSuppression.replacementCleanup.remainingAfter.some(record => record.id === 54321));
+    lateReplacementMode = false;
 
     const beforeDryCancel = calls.length;
     const dryCancel = await tool("sonarr_command_cancel", { commandId: 777, dryRun: true });

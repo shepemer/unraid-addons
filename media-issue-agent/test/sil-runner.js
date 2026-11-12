@@ -426,7 +426,7 @@ async function createFakeCodexBin(root, logPath) {
     "    ? { intent: 'plex_status', confidence: 0.99, mediaTitle: '', description: '', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, responseTopic: 'other', response: '' }",
     "    : prompt.includes('request SIL Request Movie')",
     "      ? { intent: 'media_request', confidence: 0.99, mediaTitle: 'SIL Request Movie', description: '', clarification: '', mediaType: 'movie', year: 2025, seasons: [], allSeasons: false, responseTopic: 'other', response: '' }",
-    "      : { intent: 'issue_report', confidence: 0.97, mediaTitle: 'SIL Slack Movie', description: 'Playback stops after ten minutes.', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, responseTopic: 'other', response: '' };",
+    "      : { intent: 'issue_report', confidence: 0.97, hasNewIssueEvidence: true, mediaTitle: 'SIL Slack Movie', description: 'Playback stops after ten minutes.', clarification: '', mediaType: '', year: null, seasons: [], allSeasons: false, responseTopic: 'other', response: '' };",
     "  const outputPathIndex = process.argv.indexOf('--output-last-message');",
     "  if (outputPathIndex >= 0) writeFileSync(process.argv[outputPathIndex + 1], JSON.stringify(result));",
     "  process.stdout.write(`${JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 40, output_tokens: 10, total_tokens: 50 } })}\\n`);",
@@ -978,7 +978,8 @@ async function assertSlackIssueAndStatusFlow(agent, baseUrl, codexLogPath, fakeM
   assert.deepEqual(await service.ingestEnvelope(followupEnvelope), { accepted: true, duplicate: false });
   assert.equal(await service.processPendingForTest(), 1);
   const afterFollowup = await api(baseUrl, `/api/jobs/${investigated.result.jobId}`);
-  assert.equal(afterFollowup.detail.job.state, "detected");
+  assert.equal(afterFollowup.detail.job.state, "awaiting_action_approval", "additional evidence does not automatically restart investigation");
+  // The operator explicitly requests another investigation through the API.
   const refreshed = await api(baseUrl, "/api/investigate", {
     method: "POST",
     body: JSON.stringify({ snapshotId: latest.snapshot.id, index: slackEntry.idx })

@@ -112,15 +112,24 @@ try {
     "media_public_library_summary", "media_public_title_summary", "media_public_watchtime_summary",
     "media_public_health_summary", "media_public_queue_summary", "media_public_subtitle_summary",
     "media_public_recent_additions", "media_public_request_status", "plex_public_bandwidth_summary",
-    "plex_availability", "plex_search", "plex_get_metadata", "sonarr_list_series", "sonarr_list_episodes",
+    "plex_availability", "plex_search", "plex_get_metadata", "plex_list_libraries", "plex_list_library_items",
+    "plex_list_show_seasons", "plex_list_season_children", "plex_scan_status", "sonarr_list_series", "sonarr_list_episodes",
     "sonarr_queue", "sonarr_quality_profiles", "sonarr_interactive_search_season", "radarr_lookup_movie",
     "radarr_interactive_search_movie", "qbittorrent_list_torrents", "seerr_public_search_media", "seerr_public_media_details"
   ]) assert.ok(gatewayTools.has(name), `${name} must survive actual tool-schema and description filtering`);
+  for (const name of ["plex_list_show_seasons", "plex_list_season_children"]) {
+    assert.equal(validateSlackGatewayArguments(gatewayTools.get(name).inputSchema, { ratingKey: "12345", limit: 20 }), true, name);
+    assert.equal(validateSlackGatewayArguments(gatewayTools.get(name).inputSchema, { ratingKey: 12345, limit: 20 }), true, name);
+    assert.equal(validateSlackGatewayArguments(gatewayTools.get(name).inputSchema, { ratingKey: "/library/metadata/12345" }), false, name);
+    assert.equal(validateSlackGatewayArguments(gatewayTools.get(name).inputSchema, { ratingKey: "12345", userId: "UPRIVATE" }), false, name);
+  }
   assert.equal(validateSlackGatewayArguments(gatewayTools.get("seerr_public_search_media").inputSchema, { query: "mystery movies", page: 1 }), true);
   assert.equal(validateSlackGatewayArguments(gatewayTools.get("seerr_public_media_details").inputSchema, { mediaType: "movie", tmdbId: 123 }), true);
   assert.equal(validateSlackGatewayArguments(gatewayTools.get("media_public_watchtime_summary").inputSchema, { periodDays: 30, title: "Fixture Mystery", mediaType: "movie" }), true);
   assert.equal(validateSlackGatewayArguments(gatewayTools.get("media_public_watchtime_summary").inputSchema, { periodDays: 30, userId: "UPRIVATE" }), false);
-  for (const name of ["plex_active_sessions", "tautulli_history", "tracearr_history", "tracearr_users", "seerr_request_details", "seerr_list_issues", "media_file_delete", "sonarr_search_episode", "seerr_request_media"]) {
+  for (const name of ["plex_active_sessions", "tautulli_history", "tracearr_history", "tracearr_users", "seerr_request_details", "seerr_list_issues", "media_file_delete", "sonarr_search_episode", "seerr_request_media",
+    "plex_playback_attempt_diagnostics", "plex_issue_session_correlation", "plex_transcode_session_diagnostics", "plex_transcoder_logs_for_session",
+    "plex_test_playback", "plex_set_stream_preferences", "plex_set_default_stream_or_mkv_track_flags"]) {
     assert.equal(gatewayTools.has(name), false, name);
   }
 

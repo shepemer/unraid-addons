@@ -5,6 +5,7 @@ import { issueLifecycleFromComments, issueQueue, issueTableMarkdown, normalizeIs
 import {
   applySlackIssueEvidenceMessage,
   claimSlackOwnerControl,
+  cancelSlackInvestigationOutbox,
   completeSlackOwnerControl,
   completeAgentRun,
   createAgentRun,
@@ -94,6 +95,7 @@ import { parseSlackIntentResult, queueSlackIssueMessage, selectSeerrMediaMatch, 
 import { runSlackChatReply } from "./slack-chat.js";
 import { publicSlackResolution } from "./slack-resolution.js";
 import { publicSlackRepairProgress, slackRepairFailureAttempt } from "./slack-progress.js";
+import { publicResearchTimeframe } from "./slack-readonly.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -290,10 +292,14 @@ function mediaInfoWatchtimeMessage(result, request) {
   if (!result?.available) {
     return "I could not read aggregate Plex watch-time statistics right now.";
   }
-  const days = Number.isInteger(Number(result.periodDays)) ? Number(result.periodDays) : 30;
   const playCount = Math.max(0, Math.floor(Number(result.playCount) || 0));
   const duration = formatPublicDuration(result.totalWatchSeconds);
-  const range = `the last ${formatPublicCount(days)} day${days === 1 ? "" : "s"}`;
+  const timeframe = publicResearchTimeframe(result);
+  const range = result.period === "all_time" || timeframe.allTime ? "all recorded history"
+    : result.periodStartDate && result.periodEndDate && Object.keys(publicResearchTimeframe({ startDate: result.periodStartDate, endDate: result.periodEndDate })).length
+      ? `${result.periodStartDate} through ${result.periodEndDate}`
+      : timeframe.periodDays ? `the last ${formatPublicCount(timeframe.periodDays)} day${timeframe.periodDays === 1 ? "" : "s"}`
+        : "the returned scope";
   if (result.scope === "title") {
     const label = mediaTitleLabel({
       title: request?.mediaTitle,
@@ -309,8 +315,9 @@ function mediaInfoWatchtimeMessage(result, request) {
     return `Over ${range}, ${label} was played ${qualifier}${formatPublicCount(playCount)} time${playCount === 1 ? "" : "s"} `
       + `for ${qualifier}${duration} in aggregate.`;
   }
-  return `Over ${range}, Plex recorded ${formatPublicCount(playCount)} play${playCount === 1 ? "" : "s"} `
-    + `for ${duration} in aggregate.`;
+  const qualifier = result.complete === false ? "at least " : "";
+  return `Over ${range}, Plex recorded ${qualifier}${formatPublicCount(playCount)} play${playCount === 1 ? "" : "s"} `
+    + `for ${qualifier}${duration} in aggregate.${result.complete === false ? " The aggregate is incomplete." : ""}`;
 }
 
 function mediaInfoHealthMessage(result) {
@@ -2201,6 +2208,8 @@ export class MediaIssueAgent {
     this.initPromise = null;
     this.diagnosticLogger = createDiagnosticLogger(config);
     this.activeRepairRuns = new Map();
+    this.activeInvestigationRuns = new Map();
+    this.investigationRunner = options.investigationRunner || runCodex;
     this.pollPromise = null;
     this.slackInvestigationPromise = null;
     this.slackControlRuns = new Map();
@@ -3186,9 +3195,6 @@ export class MediaIssueAgent {
 
   async slackReadOnlyChat(context, metadata = {}) {
     await this.init();
-    if (context.request?.researchComplexity === "excessive") {
-      return { kind: "research_scope", message: "That would exceed a short chat investigation. Narrow it to a few titles, one specific question, or a smaller time period and I can give you a useful answer within the research budget." };
-    }
     await validateCodexHome(this.config.codexHome);
     const settings = this.codexSettings().effective;
     const issue = metadata.slackIssueId ? slackIssueForId(this.config.dbPath, metadata.slackIssueId) : null;
@@ -3205,7 +3211,22 @@ export class MediaIssueAgent {
         listTools: options => this.client.listTools?.(options) || [],
         callTool: (name, args, options) => this.client.callTool(name, args, options),
         abortSignal: controller.signal,
-        onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_diagnostics", settings })
+        onEvent: event => {
+          this.recordCodexTokenUsage(event, { source: "slack_diagnostics", settings });
+          if (["slack_readonly_catalog", "slack_readonly_tool_started", "slack_readonly_tool_completed", "slack_readonly_tool_rejected"].includes(event?.type)) {
+            const status = ["ok", "started", "truncated", "unavailable", "upstream_error", "timeout", "authorization_error", "connection_error", "cancelled", "invalid_arguments", "not_allowed", "budget_exceeded"].includes(event.status) ? event.status : "unknown";
+            const counts = Object.fromEntries(["callCount", "toolCount", "durationMs", "outputBytes"]
+              .filter(key => Number.isSafeInteger(event[key]) && event[key] >= 0)
+              .map(key => [key, event[key]]));
+            // Persist only operational telemetry, never tool arguments, raw
+            // output, conversation text, upstream URLs or error descriptions.
+            this.diagnostic(["ok", "started", "truncated"].includes(status) ? "info" : "warn", event.type, {
+              ...(typeof event.toolName === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(event.toolName) ? { toolName: event.toolName } : {}),
+              status,
+              ...counts
+            });
+          }
+        }
       });
       const message = await this.slackReplyRunner({ ...this.config, codexTerminationGraceMs: 100 }, scopedContext, facts, settings, {
         abortSignal: controller.signal,
@@ -3227,6 +3248,9 @@ export class MediaIssueAgent {
     if (!issue) return { message: "I could not find this issue." };
     const job = ensureJob(this.config.dbPath, "slack", String(issueId));
     const details = this.jobDetails(job.id);
+    if (this.isSlackInvestigationPaused(job.id) && !["approved_for_execution", "executing", "drafting_comment", "awaiting_resolution_approval", "closing_issue", "reopening_issue"].includes(job.state)) {
+      return { kind: "issue_status", message: `Slack issue #${issue.id}: Investigation is paused${this.activeInvestigationRuns.has(job.id) ? "; the active worker is stopping" : ""}. Reply ‘re-investigate’ to resume. No repair has been authorized by this pause.` };
+    }
     const progress = publicSlackRepairProgress(details, {
       activeRun: this.activeRepairRuns.get(Number(job.id)),
       staleAfterMs: (this.config.recoverStaleRunSeconds || 120) * 1000
@@ -3263,6 +3287,75 @@ export class MediaIssueAgent {
     return { kind: "issue_status", message: `Slack issue #${issue.id}: ${stateMessages[job.state] || "I’m checking the current workflow state."}` };
   }
 
+  isSlackInvestigationPaused(jobId) {
+    return Boolean(getSetting(this.config.dbPath, `slack-investigation-paused:${jobId}`, false));
+  }
+
+  assertInvestigationActive(jobId, signal) {
+    if (signal?.aborted || this.isSlackInvestigationPaused(jobId)) {
+      const error = new Error("Investigation stopped by owner.");
+      error.name = "AbortError";
+      throw error;
+    }
+  }
+
+  async controlledInvestigation(job, work) {
+    if (job.source === "slack" && this.isSlackInvestigationPaused(job.id)) return { jobId: job.id, status: "paused", approvalId: null, cached: false };
+    if (this.activeInvestigationRuns.has(job.id)) throw new Error("An investigation is already running for this issue.");
+    const controller = new AbortController();
+    let settled;
+    const completed = new Promise(resolve => { settled = resolve; });
+    const active = { controller, completed };
+    this.activeInvestigationRuns.set(job.id, active);
+    try {
+      const result = await work(controller.signal);
+      this.assertInvestigationActive(job.id, controller.signal);
+      return result;
+    } catch (error) {
+      if (!controller.signal.aborted && !(job.source === "slack" && this.isSlackInvestigationPaused(job.id))) throw error;
+      return { jobId: job.id, status: "paused", approvalId: null, cached: false };
+    } finally {
+      if (this.activeInvestigationRuns.get(job.id) === active) this.activeInvestigationRuns.delete(job.id);
+      settled();
+      const resume = getSetting(this.config.dbPath, `slack-investigation-resume:${job.id}`, false);
+      if (controller.signal.aborted && resume) {
+        deleteSetting(this.config.dbPath, `slack-investigation-resume:${job.id}`);
+        deleteSetting(this.config.dbPath, `slack-investigation-paused:${job.id}`);
+        const current = jobForId(this.config.dbPath, job.id);
+        if (current.state === "blocked_needs_human") transitionJob(this.config.dbPath, job.id, [current.state], "detected");
+        setSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`, true);
+        this.scheduleSlackPoll("owner_resume_after_stop", job.issueId);
+      }
+    }
+  }
+
+  async stopSlackInvestigation(job, actor, eventId) {
+    setSetting(this.config.dbPath, `slack-investigation-paused:${job.id}`, { actor, eventId, pausedAt: new Date().toISOString() });
+    deleteSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`);
+    deleteSetting(this.config.dbPath, `slack-investigation-resume:${job.id}`);
+    cancelSlackInvestigationOutbox(this.config.dbPath, Number(job.issueId));
+    const active = this.activeInvestigationRuns.get(job.id);
+    active?.controller.abort("Investigation stopped by owner.");
+    const current = jobForId(this.config.dbPath, job.id);
+    if (["detected", "queued_for_investigation", "investigating"].includes(current.state) || (active && current.state === "awaiting_action_approval")) {
+      supersedePendingApprovals(this.config.dbPath, job.id, "action");
+      transitionJob(this.config.dbPath, job.id, [current.state], "blocked_needs_human", "Investigation paused by owner.");
+      const previous = investigationForJob(this.config.dbPath, job.id);
+      upsertInvestigation(this.config.dbPath, job.id, { status: "paused", summary: previous?.summary || "Investigation paused by owner.", evidence: previous?.evidence || {}, error: null });
+    }
+    recordAudit(this.config.dbPath, "slack_investigation_paused", { actor, eventId, active: Boolean(active) }, job.id);
+    // Most MCP calls stop immediately; Codex may need its process termination
+    // grace period. Keep Slack responsive and describe an unconfirmed stop honestly.
+    if (active) {
+      let timer;
+      await Promise.race([active.completed, new Promise(resolve => { timer = setTimeout(resolve, 1500); })]);
+      clearTimeout(timer);
+    }
+    const stopping = this.activeInvestigationRuns.has(job.id);
+    const repairActive = ["approved_for_execution", "executing", "drafting_comment", "closing_issue", "reopening_issue"].includes(current.state);
+    return { message: `${stopping ? "I’m stopping the active investigation" : "Investigation stopped"}. It stays paused until you reply ‘re-investigate’.${repairActive ? " The approved repair workflow is still active; this instruction does not stop repairs." : ""}` };
+  }
+
   async handleSlackIssueControl(issueId, control) {
     await this.init();
     const owners = Array.isArray(this.config.slackOwnerUserIds) ? this.config.slackOwnerUserIds : [];
@@ -3274,7 +3367,7 @@ export class MediaIssueAgent {
     const job = ensureJob(this.config.dbPath, "slack", String(issueId));
     const pending = pendingApprovalForJobAnyKind(this.config.dbPath, job.id);
     const action = control.action;
-    if (!["approve_repair", "approve_resolution", "retry_repair", "reinvestigate", "steer"].includes(action)) {
+    if (!["approve_repair", "approve_resolution", "retry_repair", "reinvestigate", "steer", "stop_investigation"].includes(action)) {
       return { message: "Reply ‘approve repair’, ‘approve resolution’, ‘re-investigate’, or ‘steer: …’." };
     }
     const claim = claimSlackOwnerControl(this.config.dbPath, { ...control, issueId, approvalId: pending?.id });
@@ -3282,21 +3375,43 @@ export class MediaIssueAgent {
     const actor = `slack:${control.userId}`;
     let response;
     try {
-      const busy = this.slackControlRuns.has(job.id) || ["investigating", "approved_for_execution", "executing", "drafting_comment", "closing_issue", "reopening_issue"].includes(job.state);
+      if (action === "stop_investigation") {
+        response = await this.stopSlackInvestigation(job, actor, control.eventId);
+        completeSlackOwnerControl(this.config.dbPath, control.eventId, response);
+        return response;
+      }
+      const paused = this.isSlackInvestigationPaused(job.id);
+      const activeInvestigation = this.activeInvestigationRuns.get(job.id);
+      if (action === "reinvestigate" && activeInvestigation?.controller.signal.aborted) {
+        const message = redactText(String(control.message || "").trim()).slice(0, 4000);
+        if (message && !/^(?:re[- ]?investigate|investigate again|check again)[.! ]*$/i.test(message)) {
+          const notes = getSetting(this.config.dbPath, `slack-owner-guidance:${job.id}`, []);
+          setSetting(this.config.dbPath, `slack-owner-guidance:${job.id}`, [...notes, { actor, message, eventId: control.eventId }].slice(-10));
+          if (control.messageId) applySlackIssueEvidenceMessage(this.config.dbPath, issue.id, control.messageId);
+        }
+        setSetting(this.config.dbPath, `slack-investigation-resume:${job.id}`, { eventId: control.eventId, actor });
+        response = { message: "I queued your re-investigation request. It will start after the previous investigation finishes stopping; repairs still need approval." };
+        completeSlackOwnerControl(this.config.dbPath, control.eventId, response);
+        return response;
+      }
+      const busy = Boolean(activeInvestigation) || this.slackControlRuns.has(job.id) || ["investigating", "approved_for_execution", "executing", "drafting_comment", "closing_issue", "reopening_issue"].includes(job.state);
+      if (action === "reinvestigate" && !busy) deleteSetting(this.config.dbPath, `slack-investigation-paused:${job.id}`);
       if (action === "steer" || (action === "reinvestigate" && !/^(?:re[- ]?investigate|investigate again|check again)[.! ]*$/i.test(String(control.message || "")) && control.message)) {
         const message = redactText(String(control.message || "").trim()).slice(0, 4000);
         if (!message) throw new Error("A steering instruction is required.");
         const notes = getSetting(this.config.dbPath, `slack-owner-guidance:${job.id}`, []);
         setSetting(this.config.dbPath, `slack-owner-guidance:${job.id}`, [...notes, { actor, message, eventId: control.eventId }].slice(-10));
         if (control.messageId) applySlackIssueEvidenceMessage(this.config.dbPath, issue.id, control.messageId);
-        if (!busy) {
+        if (!busy && (!paused || action === "reinvestigate")) {
           if (issue.status === "closed") setSlackIssueStatus(this.config.dbPath, issue.id, "open");
           supersedeAllPendingApprovals(this.config.dbPath, job.id);
           if (job.state !== "detected") transitionJob(this.config.dbPath, job.id, [job.state], "detected");
           setSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`, true);
         }
-        this.scheduleSlackPoll("owner_steering", issue.id);
-        response = { message: busy
+        if (!paused || action === "reinvestigate") this.scheduleSlackPoll("owner_steering", issue.id);
+        response = { message: paused && action !== "reinvestigate"
+          ? "I saved your steering. Investigation remains paused; reply ‘re-investigate’ when you want it to resume."
+          : busy
           ? "I saved your steering. It will be included in the next investigation before another approval; the currently running work has not been interrupted."
           : "I saved your steering and queued a fresh read-only investigation. I’ll post the revised findings here for approval." };
       } else if (busy) {
@@ -3411,13 +3526,9 @@ export class MediaIssueAgent {
         };
         break;
       case "watchtime_summary": {
-        const requestedDays = Number(request.periodDays);
-        const periodDays = Number.isInteger(requestedDays) && requestedDays >= 1 && requestedDays <= 366
-          ? requestedDays
-          : 30;
         toolName = "media_public_watchtime_summary";
         args = {
-          periodDays,
+          ...publicResearchTimeframe(request),
           ...(title ? { title } : {}),
           ...(request.mediaType ? { mediaType: request.mediaType } : {}),
           ...(request.year ? { year: request.year } : {})
@@ -3677,6 +3788,14 @@ export class MediaIssueAgent {
         if (record.isClosed) continue;
         const job = ensureJob(this.config.dbPath, "slack", record.issueId);
         if (this.slackControlRuns.has(job.id)) continue;
+        if (this.isSlackInvestigationPaused(job.id) && getSetting(this.config.dbPath, `slack-investigation-resume:${job.id}`, false)
+          && !this.activeInvestigationRuns.has(job.id) && ["blocked_needs_human", "detected", "queued_for_investigation"].includes(job.state)) {
+          deleteSetting(this.config.dbPath, `slack-investigation-resume:${job.id}`);
+          deleteSetting(this.config.dbPath, `slack-investigation-paused:${job.id}`);
+          if (job.state === "blocked_needs_human") { transitionJob(this.config.dbPath, job.id, [job.state], "detected"); job.state = "detected"; }
+          setSetting(this.config.dbPath, `slack-investigation-announced:${job.id}`, true);
+        }
+        if (this.isSlackInvestigationPaused(job.id) && job.state !== "approved_for_execution") continue;
         if (job.state === "approved_for_execution") {
           // Resume only an already-approved job after a process restart.
           this.startSlackControlWork(job.id, () => this.continueJob(job.id, "slack_recovery"));
@@ -3692,6 +3811,7 @@ export class MediaIssueAgent {
           try {
             await this.investigate(location.snapshotId, location.index, { force: true });
           } catch (error) {
+            if (this.isSlackInvestigationPaused(job.id)) continue;
             const current = jobForId(this.config.dbPath, job.id);
             if (current?.state === "investigating") continue; // Another caller may own this investigation.
             if (["detected", "queued_for_investigation"].includes(current?.state)) {
@@ -3701,6 +3821,7 @@ export class MediaIssueAgent {
               "The read-only investigation could not finish. The issue remains open; the owner can reply ‘re-investigate’ to retry.");
           }
         }
+        if (this.isSlackInvestigationPaused(job.id)) continue;
         const current = jobForId(this.config.dbPath, job.id);
         if (current?.state === "awaiting_action_approval") await this.publishSlackInvestigation(job.id);
         if (current?.state === "awaiting_resolution_approval") await this.publishSlackResolution(job.id);
@@ -3716,7 +3837,7 @@ export class MediaIssueAgent {
   async publishSlackInvestigation(jobId) {
     if (!this.slackService) return;
     const details = this.jobDetails(jobId);
-    if (details?.job?.source !== "slack" || details.job.state !== "awaiting_action_approval") return;
+    if (details?.job?.source !== "slack" || details.job.state !== "awaiting_action_approval" || this.isSlackInvestigationPaused(jobId)) return;
     const issue = slackIssueForId(this.config.dbPath, Number(details.job.issueId));
     const approval = pendingApprovalForJob(this.config.dbPath, jobId, "action");
     if (!issue || !approval) return;
@@ -3726,6 +3847,7 @@ export class MediaIssueAgent {
     try {
       const settings = this.codexSettings().effective;
       planSummary = await this.slackPlanSummaryRunner(this.config, details, settings, {
+        abortSignal: this.activeInvestigationRuns.get(jobId)?.controller.signal,
         onEvent: event => this.recordCodexTokenUsage(event, { jobId, source: "slack_public_plan", settings })
       });
     } catch (error) {
@@ -3733,7 +3855,7 @@ export class MediaIssueAgent {
     }
     // New evidence/steering may supersede this plan while the public summary runs.
     const latest = pendingApprovalForJob(this.config.dbPath, jobId, "action");
-    if (latest?.id !== approval.id || jobForId(this.config.dbPath, jobId)?.state !== "awaiting_action_approval") return;
+    if (latest?.id !== approval.id || jobForId(this.config.dbPath, jobId)?.state !== "awaiting_action_approval" || this.isSlackInvestigationPaused(jobId)) return;
     const mode = approval.payload?.plan?.executionMode;
     const scope = mode === "none"
       ? "Approval skips media changes and moves to final review."
@@ -3748,7 +3870,7 @@ export class MediaIssueAgent {
       slackIssueId: issue.id, threadId: issue.threadId, channelId: issue.channelId, rootTs: issue.rootTs
     }, "investigation_ready", key,
     `*Investigation complete*\n\n${planText}\n\n${scope} Posting the resolution and closing require separate approval.\n\nReply \`approve repair\`, \`steer: …\`, or \`re-investigate\`. No repair has started.`,
-    { notifyOwners: true });
+    { notifyOwners: true, shouldEnqueue: () => !this.isSlackInvestigationPaused(jobId) && pendingApprovalForJob(this.config.dbPath, jobId, "action")?.id === approval.id });
     setSetting(this.config.dbPath, key, true);
   }
 
@@ -3810,49 +3932,17 @@ export class MediaIssueAgent {
     return { jobId: job.id };
   }
 
-  async onSlackIssueEvidenceUpdated(issue) {
+  async onSlackIssueEvidenceUpdated(issue, { evidenceApplied = true } = {}) {
     const job = ensureJob(this.config.dbPath, "slack", String(issue.id));
-    const busyStates = new Set([
-      "investigating",
-      "approved_for_execution",
-      "executing",
-      "drafting_comment",
-      "closing_issue",
-      "reopening_issue"
-    ]);
-    const currentJob = jobForId(this.config.dbPath, job.id);
-    const busy = Boolean(currentJob && busyStates.has(currentJob.state));
-    if (!busy) {
-      supersedeAllPendingApprovals(this.config.dbPath, job.id);
-    }
-    let currentIssue = issue;
-    if (issue.status === "closed" && currentJob?.state !== "reopening_issue") {
-      currentIssue = setSlackIssueStatus(this.config.dbPath, issue.id, "open");
-      queueSlackIssueMessage(
-        this.config.dbPath,
-        issue.id,
-        "issue_reopened_by_followup",
-        `slack-followup-reopened:${issue.id}:${issue.evidenceVersion}`,
-        REOPENED_MARKER
-      );
-    }
-    if (currentJob && !busy && currentJob.state !== "detected") {
-      transitionJob(this.config.dbPath, job.id, [currentJob.state], "detected");
-    }
+    if (!evidenceApplied) return { jobId: job.id, investigationQueued: false };
     recordAudit(this.config.dbPath, "slack_issue_evidence_updated", sanitizeValue({
-      evidenceVersion: currentIssue.evidenceVersion,
-      investigatedEvidenceVersion: currentIssue.investigatedEvidenceVersion,
-      deferredForBusyJob: busy
+      evidenceVersion: issue.evidenceVersion,
+      investigatedEvidenceVersion: issue.investigatedEvidenceVersion,
+      investigationQueued: false
     }), job.id);
-    this.diagnostic("info", "slack_issue_evidence_updated", {
-      jobId: job.id,
-      slackIssueId: issue.id,
-      evidenceVersion: currentIssue.evidenceVersion,
-      jobState: currentJob?.state || null,
-      deferredForBusyJob: busy
-    });
-    this.scheduleSlackPoll("evidence_updated", issue.id);
-    return { jobId: job.id };
+    // Approval performs an evidence-version check before execution. Leave its
+    // reviewable plan intact; new evidence alone never reopens or queues work.
+    return { jobId: job.id, investigationQueued: false };
   }
 
   queueSlackJobUpdate(jobId, kind, dedupeKey, message) {
@@ -3895,6 +3985,7 @@ export class MediaIssueAgent {
     if (Number(issue.evidenceVersion || 0) <= investigatedVersion) {
       return null;
     }
+    if (this.isSlackInvestigationPaused(jobId)) throw new Error("Investigation is paused; explicitly re-investigate before approving a plan with new evidence.");
     supersedeAllPendingApprovals(this.config.dbPath, jobId);
     const currentJob = jobForId(this.config.dbPath, jobId);
     if (currentJob?.state !== "detected") {
@@ -4122,27 +4213,11 @@ export class MediaIssueAgent {
         setSlackIssueStatus(this.config.dbPath, Number(entry.issueId), "closed");
         const latestIssue = slackIssueForId(this.config.dbPath, Number(entry.issueId));
         if (Number(latestIssue?.evidenceVersion || 0) > slackEvidenceVersion) {
-          setSlackIssueStatus(this.config.dbPath, Number(entry.issueId), "open");
-          transitionJob(this.config.dbPath, job.id, ["closed"], "detected");
-          queueSlackIssueMessage(
-            this.config.dbPath,
-            Number(entry.issueId),
-            "issue_reopened_after_concurrent_followup",
-            `concurrent-followup-reopened:${entry.issueId}:${latestIssue.evidenceVersion}`,
-            REOPENED_MARKER
-          );
-          recordAudit(this.config.dbPath, "slack_close_reversed_for_new_evidence", sanitizeValue({
-            actor,
-            approvedEvidenceVersion: slackEvidenceVersion,
-            currentEvidenceVersion: latestIssue.evidenceVersion
-          }), job.id);
-          this.scheduleSlackPoll("concurrent_followup_after_direct_close", entry.issueId);
-          return {
-            jobId: job.id,
-            status: "open",
-            results,
-            reopenedForNewEvidence: true
-          };
+          queueSlackIssueMessage(this.config.dbPath, Number(entry.issueId), "closed_issue_evidence_received",
+            `closed-evidence-review:${entry.issueId}:${latestIssue.evidenceVersion}`,
+            "New information arrived during closure. The issue remains closed; the owner can reply ‘re-investigate’ to reopen and check it.");
+          recordAudit(this.config.dbPath, "slack_closed_with_concurrent_evidence", { actor, approvedEvidenceVersion: slackEvidenceVersion, currentEvidenceVersion: latestIssue.evidenceVersion }, job.id);
+          return { jobId: job.id, status: "closed", results, newEvidenceAwaitingOwner: true };
         }
       }
       recordAudit(this.config.dbPath, "direct_close_completed", sanitizeValue({ actor, results }), job.id);
@@ -4226,12 +4301,21 @@ export class MediaIssueAgent {
 
   async investigate(snapshotId, index, options = {}) {
     await this.init();
+    const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
+    if (!entry) throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
+    const job = ensureJob(this.config.dbPath, entry.source, entry.issueId, "queued_for_investigation");
+    return this.controlledInvestigation(job, abortSignal => this.runInvestigation(snapshotId, index, { ...options, abortSignal }));
+  }
+
+  async runInvestigation(snapshotId, index, options = {}) {
+    await this.init();
     await validateCodexHome(this.config.codexHome);
     const entry = snapshotEntry(this.config.dbPath, snapshotId, index);
     if (!entry) {
       throw new Error(`Snapshot ${snapshotId} index ${index} was not found`);
     }
     const job = ensureJob(this.config.dbPath, entry.source, entry.issueId, "queued_for_investigation");
+    this.assertInvestigationActive(job.id, options.abortSignal);
     this.diagnostic("info", "investigation_requested", {
       jobId: job.id,
       snapshotId,
@@ -4287,7 +4371,7 @@ export class MediaIssueAgent {
           mediaTitle: details.issue.mediaTitle,
           description: details.issue.description,
           verbose: false
-        });
+        }, { signal: options.abortSignal });
       } else {
         [details, diagnosis] = await Promise.all([
           this.client.callTool("plex_issue_details", {
@@ -4303,6 +4387,7 @@ export class MediaIssueAgent {
         ]);
       }
     } catch (error) {
+      this.assertInvestigationActive(job.id, options.abortSignal);
       const message = redactText(error.message);
       const evidence = sanitizeValue({ entry, collectionError: message });
       const summary = [
@@ -4340,6 +4425,7 @@ export class MediaIssueAgent {
         error: message
       };
     }
+    this.assertInvestigationActive(job.id, options.abortSignal);
     const ownerGuidance = entry.source === "slack"
       ? getSetting(this.config.dbPath, `slack-owner-guidance:${job.id}`, []).map(note => note.message).join("\n\n")
       : trustedServerOwnerGuidance(
@@ -4372,11 +4458,12 @@ export class MediaIssueAgent {
     try {
       const settings = this.codexSettings().effective;
       this.diagnostic("info", "codex_investigation_started", { jobId: job.id });
-      summary = await runCodex(this.config, investigationPrompt(evidence, {
+      summary = await this.investigationRunner(this.config, investigationPrompt(evidence, {
         trustedReporterGuidance: ownerGuidance
       }), {
         ...(entry.source === "slack" ? { toolFree: true, ignoreRules: true, ignoreUserConfig: true, isolatedWorkspace: true } : {}),
         settings,
+        abortSignal: options.abortSignal,
         onEvent: event => this.recordCodexTokenUsage(event, {
           jobId: job.id,
           source: "investigation",
@@ -4388,6 +4475,7 @@ export class MediaIssueAgent {
         summaryLength: summary.length
       });
     } catch (error) {
+      this.assertInvestigationActive(job.id, options.abortSignal);
       const message = redactText(error.message);
       this.diagnostic("error", "codex_investigation_failed", {
         jobId: job.id,
@@ -4415,48 +4503,14 @@ export class MediaIssueAgent {
       );
       return { jobId: job.id, approvalId: null, summary, evidence, status: investigation.status, cached: false, error: message };
     }
+    this.assertInvestigationActive(job.id, options.abortSignal);
     if (slackIssue) {
       const latestIssue = slackIssueForId(this.config.dbPath, slackIssue.id);
       if (latestIssue && Number(latestIssue.evidenceVersion) > Number(slackIssue.evidenceVersion)) {
-        const attempt = Number(options.evidenceRefreshAttempt || 0);
-        this.diagnostic("info", "slack_investigation_evidence_changed", {
-          jobId: job.id,
-          slackIssueId: slackIssue.id,
-          investigatedEvidenceVersion: slackIssue.evidenceVersion,
-          currentEvidenceVersion: latestIssue.evidenceVersion,
-          refreshAttempt: attempt + 1
-        });
-        recordAudit(this.config.dbPath, "slack_investigation_evidence_changed", sanitizeValue({
-          investigatedEvidenceVersion: slackIssue.evidenceVersion,
-          currentEvidenceVersion: latestIssue.evidenceVersion,
-          refreshAttempt: attempt + 1
-        }), job.id);
-        transitionJob(this.config.dbPath, job.id, ["investigating"], "detected");
-        if (attempt >= 2) {
-          const message = "Slack issue evidence kept changing during investigation. Retry after the conversation settles.";
-          upsertInvestigation(this.config.dbPath, job.id, {
-            status: "failed",
-            summary: message,
-            evidence,
-            error: message
-          });
-          transitionJob(this.config.dbPath, job.id, ["detected"], "failed_retryable", message);
-          return {
-            jobId: job.id,
-            approvalId: null,
-            summary: message,
-            evidence,
-            status: "failed",
-            cached: false,
-            error: message
-          };
-        }
-        return this.investigate(snapshotId, index, {
-          force: true,
-          evidenceRefreshAttempt: attempt + 1
-        });
+        recordAudit(this.config.dbPath, "slack_investigation_evidence_changed", { investigatedEvidenceVersion: slackIssue.evidenceVersion, currentEvidenceVersion: latestIssue.evidenceVersion, refreshDeferredUntilOwnerRequest: true }, job.id);
       }
     }
+
     supersedePendingApprovals(this.config.dbPath, job.id);
     const investigation = upsertInvestigation(this.config.dbPath, job.id, {
       status: "ready",
@@ -4490,9 +4544,17 @@ export class MediaIssueAgent {
   async steerInvestigation(jobId, message, actor = "operator") {
     await this.init();
     const job = jobForId(this.config.dbPath, jobId);
+    if (!job) throw new Error(`Job ${jobId} was not found`);
+    return this.controlledInvestigation(job, abortSignal => this.runSteeredInvestigation(jobId, message, actor, abortSignal));
+  }
+
+  async runSteeredInvestigation(jobId, message, actor, abortSignal) {
+    await this.init();
+    const job = jobForId(this.config.dbPath, jobId);
     if (!job) {
       throw new Error(`Job ${jobId} was not found`);
     }
+    this.assertInvestigationActive(jobId, abortSignal);
     const current = investigationForJob(this.config.dbPath, jobId);
     if (!current) {
       throw new Error(`Job ${jobId} has no investigation to steer`);
@@ -4511,6 +4573,7 @@ export class MediaIssueAgent {
       throw new Error(`Cannot transition job ${jobId} from ${job.state} to investigating`);
     }
     await validateCodexHome(this.config.codexHome);
+    this.assertInvestigationActive(jobId, abortSignal);
     transitionJob(this.config.dbPath, jobId, [
       "awaiting_action_approval",
       "failed_retryable",
@@ -4533,11 +4596,12 @@ export class MediaIssueAgent {
     try {
       const settings = this.codexSettings().effective;
       this.diagnostic("info", "codex_steered_investigation_started", { jobId });
-      summary = await runCodex(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage, {
+      summary = await this.investigationRunner(this.config, steeredInvestigationPrompt(evidence, current.summary, operatorMessage, {
         trustedReporterGuidance: trustedReporterGuidanceFromEvidence(evidence)
       }), {
         ...(job.source === "slack" ? { toolFree: true, ignoreRules: true, ignoreUserConfig: true, isolatedWorkspace: true } : {}),
         settings,
+        abortSignal,
         onEvent: event => this.recordCodexTokenUsage(event, {
           jobId,
           source: "steered_investigation",
@@ -4549,6 +4613,7 @@ export class MediaIssueAgent {
         summaryLength: summary.length
       });
     } catch (error) {
+      this.assertInvestigationActive(jobId, abortSignal);
       const reason = redactText(error.message);
       this.diagnostic("error", "codex_steered_investigation_failed", {
         jobId,
@@ -4579,6 +4644,7 @@ export class MediaIssueAgent {
         error: reason
       };
     }
+    this.assertInvestigationActive(jobId, abortSignal);
     const investigation = upsertInvestigation(this.config.dbPath, jobId, {
       status: "ready",
       summary,
@@ -5442,35 +5508,11 @@ export class MediaIssueAgent {
         const latestIssue = slackIssueForId(this.config.dbPath, Number(issueId));
         const approvedEvidenceVersion = Number(approval.payload?.slackEvidenceVersion || 0);
         if (Number(latestIssue?.evidenceVersion || 0) > approvedEvidenceVersion) {
-          setSlackIssueStatus(this.config.dbPath, Number(issueId), "open");
-          transitionJob(this.config.dbPath, jobId, ["closed"], "detected");
-          queueSlackIssueMessage(
-            this.config.dbPath,
-            Number(issueId),
-            "issue_reopened_after_concurrent_followup",
-            `concurrent-followup-reopened:${issueId}:${latestIssue.evidenceVersion}`,
-            REOPENED_MARKER
-          );
-          recordAudit(this.config.dbPath, "slack_close_reversed_for_new_evidence", sanitizeValue({
-            actor,
-            approvalId: approval.id,
-            approvedEvidenceVersion,
-            currentEvidenceVersion: latestIssue.evidenceVersion
-          }), jobId);
-          this.scheduleSlackPoll("concurrent_followup_after_approved_close", issueId);
-          const refreshed = await this.refreshStaleSlackInvestigation(
-            jobId,
-            actor,
-            "new Slack thread evidence arrived while final closure was running"
-          );
-          return {
-            ...(refreshed || {}),
-            jobId,
-            status: refreshed ? "awaiting_action_approval" : "detected",
-            approvals,
-            results,
-            reopenedForNewEvidence: true
-          };
+          queueSlackIssueMessage(this.config.dbPath, Number(issueId), "closed_issue_evidence_received",
+            `closed-evidence-review:${issueId}:${latestIssue.evidenceVersion}`,
+            "New information arrived during closure. The issue remains closed; the owner can reply ‘re-investigate’ to reopen and check it.");
+          recordAudit(this.config.dbPath, "slack_closed_with_concurrent_evidence", { actor, approvalId: approval.id, approvedEvidenceVersion, currentEvidenceVersion: latestIssue.evidenceVersion }, jobId);
+          return { jobId, status: "closed", approvals, results, newEvidenceAwaitingOwner: true };
         }
       }
       if (closeIssue) {

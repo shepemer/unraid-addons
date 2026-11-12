@@ -28,6 +28,14 @@ assert.match(prompt, /If the user explicitly asks for detail, expand only as muc
 assert.match(prompt, /Format for Slack mrkdwn: use \*bold\*/);
 assert.match(prompt, /Preserve line breaks between short paragraphs and bullet items/);
 assert.doesNotMatch(prompt, /undefined/);
+for (const timeframe of [{ allTime: true }, { periodDays: 1826 }, { periodMonths: 60 }, { periodYears: 5 }, { startDate: "2010-01-01", endDate: "2026-11-11" }]) {
+  const scoped = slackChatReplyPrompt({ newestMessage: "What is the total?", request: timeframe }, facts);
+  const payload = JSON.parse(scoped.split("Untrusted context and privacy-projected diagnostic facts:\n")[1]);
+  assert.deepEqual(payload.request, timeframe);
+}
+assert.match(prompt, /including all time/);
+assert.match(prompt, /Label years\/months as approximate duration equivalents/);
+assert.match(prompt, /never present it as the requested complete total/);
 const scopedContext = {
   newestMessage: "is it downloaded?",
   issue: { mediaTitle: "The Great Escape", description: "Season 5 episode 6 is missing. <@UOWNER123> reported it.", reporterUsername: "private-person" },

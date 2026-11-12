@@ -7,6 +7,10 @@ const definitions = [
   read("catalog_search", { query: { type: "string", minLength: 1 }, year: { anyOf: [{ type: "integer", minimum: 1870 }, { type: "null" }] } }, ["query"]),
   read("sonarr_recent_history", { limit: { type: "integer", maximum: 100 } }),
   read("plex_get_metadata", { ratingKey: { type: "string", pattern: "^[0-9]+$" } }, ["ratingKey"]),
+  read("plex_list_libraries"),
+  read("plex_search", { query: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: 250 } }, ["query"]),
+  read("plex_list_show_seasons", { ratingKey: { anyOf: [{ type: "string" }, { type: "number" }] }, limit: { type: "integer", minimum: 1, maximum: 250 } }, ["ratingKey"]),
+  read("plex_list_season_children", { ratingKey: { anyOf: [{ type: "string" }, { type: "number" }] }, limit: { type: "integer", minimum: 1, maximum: 250 } }, ["ratingKey"]),
   read("media_public_watchtime_summary", { periodDays: { type: "integer", minimum: 1, maximum: 366 }, userId: { type: "integer" } }),
   read("media_probe_video_content", { ratingKey: { type: "string" }, path: { type: "string" }, comparePath: { type: "string" }, includeFrameHashes: { type: "boolean" } }),
   read("private_files", { path: { type: "string" } }, ["path"]),
@@ -43,6 +47,69 @@ assert.equal(scrubbed.id, 8);
 assert.equal(scrubbed.user, undefined);
 for (const key of ["viewCount", "viewOffset", "viewedLeafCount", "lastViewedAt", "userRating"]) assert.equal(scrubbed[key], undefined, key);
 for (const secret of ["Private Viewer", "Secret Person", "/mnt/private", "private-host", "8.8.8.8", "supersecret", "owner@example.net", "private-api-key", "private-device"]) assert.equal(JSON.stringify(scrubbed).includes(secret), false, secret);
+
+const plexLibraries = { MediaContainer: { Directory: [{ key: "2", type: "show", title: "TV Shows", Location: [{ path: "/mnt/private/tv" }], agent: "tv.plex.agents.series" }], machineIdentifier: "PRIVATE-SERVER" } };
+const publicLibraries = scrubSlackReadOnlyValue(plexLibraries);
+assert.equal(publicLibraries.MediaContainer.Directory[0].key, "2", "Plex's structural Directory collection preserves section selectors");
+assert.equal(publicLibraries.MediaContainer.Directory[0].title, "TV Shows");
+assert.doesNotMatch(JSON.stringify(publicLibraries), /PRIVATE|private\/tv|Location|machineIdentifier/);
+for (const unsafe of [{ Directory: [{ key: "2", type: "show", title: "Private folder" }] }, { MediaContainer: { Directory: [{ key: "2", type: "directory", name: "Private folder", path: "/private/path" }] } }]) {
+  assert.doesNotMatch(JSON.stringify(scrubSlackReadOnlyValue(unsafe)), /Private folder|Directory|private\/path/);
+}
+
+const traversalEvents = [];
+const traversed = [];
+const plexGateway = await startSlackReadOnlyGateway({}, {
+  listTools: async () => definitions,
+  onEvent: event => traversalEvents.push(event),
+  callTool: async (name, args) => {
+    traversed.push({ name, args });
+    if (name === "plex_list_libraries") return plexLibraries;
+    if (name === "plex_search") return { MediaContainer: { size: 2, Hub: ["movie", "show"].map(type => ({ type, size: 40, Metadata: Array.from({ length: 40 }, (_, index) => ({
+      ratingKey: `${type === "show" ? "100" : "900"}${index}`, type,
+      title: index ? `Another ${type} ${index}` : "The Great Escape", year: type === "show" ? 2018 : 1963,
+      originallyAvailableAt: type === "show" ? "2018-07-01" : "1963-06-20",
+      addedAt: 1770000000, leafCount: 72, summary: "Public catalog synopsis. ".repeat(50),
+      viewCount: 18, lastViewedAt: 1770000010, user: { name: "PRIVATE VIEWER" },
+      Media: [{ id: 812, Part: [{ id: 913, file: "/mnt/private/video.mkv" }] }]
+    })) })) } };
+    if (name === "plex_list_show_seasons") {
+      assert.equal(args.ratingKey, "1000");
+      return { ratingKey: "1000", total: 5, returned: 5, seasons: [1, 2, 3, 4, 5].map(index => ({ ratingKey: `200${index}`, index, title: `Season ${index}`, childCount: 12, addedAt: 1770000020, originallyAvailableAt: "2025-01-01" })) };
+    }
+    assert.equal(name, "plex_list_season_children");
+    assert.equal(args.ratingKey, "2005");
+    return { ratingKey: "2005", total: 2, returned: 2, children: [1, 2].map(index => ({ ratingKey: `300${index}`, parentRatingKey: "2005", index, parentIndex: 5, title: `Episode ${index}`, addedAt: 1770000030, updatedAt: 1770000040, originallyAvailableAt: "2025-06-01", viewedLeafCount: 3, parts: [{ id: 912, file: "/mnt/private/episode.mkv" }] })) };
+  }
+});
+try {
+  const call = async (name, args) => {
+    const response = await fetch(plexGateway.url, { method: "POST", headers: { authorization: `Bearer ${plexGateway.token}` }, body: JSON.stringify({ jsonrpc: "2.0", id: traversed.length + 1, method: "tools/call", params: { name, arguments: args } }) }).then(response => response.json());
+    const content = response.result.content[0].text;
+    assert.ok(Buffer.byteLength(content) <= 8 * 1024);
+    assert.doesNotMatch(content, /PRIVATE VIEWER|private\/|viewCount|lastViewedAt|viewedLeafCount/);
+    return JSON.parse(content);
+  };
+  assert.equal((await call("plex_list_libraries", {})).MediaContainer.Directory[0].key, "2");
+  const search = await call("plex_search", { query: "The Great Escape", limit: 40 });
+  assert.equal(search.truncated, true, "Oversized nested Plex results explicitly mark incomplete evidence");
+  assert.equal(search.MediaContainer.Hub.length, 2, "A large first hub cannot consume all remaining hubs' evidence");
+  const show = search.MediaContainer.Hub.find(hub => hub.type === "show").Metadata.find(item => item.title === "The Great Escape" && item.year === 2018);
+  assert.equal(show.ratingKey, "1000");
+  assert.equal(show.originallyAvailableAt, "2018-07-01");
+  const seasons = await call("plex_list_show_seasons", { ratingKey: show.ratingKey });
+  const season = seasons.seasons.find(item => item.index === 5);
+  const children = await call("plex_list_season_children", { ratingKey: season.ratingKey });
+  assert.equal(children.children.length, 2);
+  assert.equal(children.children[0].parentIndex, 5);
+  assert.equal(children.children[0].addedAt, 1770000030);
+  const presentation = plexGateway.getEvidence();
+  assert.doesNotMatch(JSON.stringify(presentation), /ratingKey|parentRatingKey|"key"|"id"|1000|2005|3001/);
+  assert.equal(presentation[3].result.children[0].addedAt, 1770000030, "Presentation retains public date evidence without internal selectors");
+  assert.equal(presentation[3].result.children[0].originallyAvailableAt, "2025-06-01");
+  assert.ok(traversalEvents.some(event => event.toolName === "plex_search" && event.status === "truncated"));
+  assert.doesNotMatch(JSON.stringify(traversalEvents), /PRIVATE|ratingKey|Great Escape|query|arguments|result|\/mnt/);
+} finally { await plexGateway.close(); }
 
 let upstream = [];
 const gateway = await startSlackReadOnlyGateway({}, {
@@ -111,4 +178,22 @@ try {
 } finally { await aborted.close(); }
 
 await assert.rejects(startSlackReadOnlyGateway({}, { listTools: async () => new Promise(() => {}), deadlineMs: Date.now() + 20 }), /discovery is unavailable/);
+
+const failures = [];
+const unavailable = await startSlackReadOnlyGateway({}, {
+  listTools: async () => definitions, onEvent: event => failures.push(event),
+  callTool: async (_name, args) => {
+    if (args.query === "unavailable") return { available: false, records: [] };
+    throw new Error("401 Unauthorized PRIVATE endpoint https://private.example/token?secret=bad");
+  }
+});
+try {
+  for (const query of ["unavailable", "failure"]) {
+    const result = await fetch(unavailable.url, { method: "POST", headers: { authorization: `Bearer ${unavailable.token}` }, body: JSON.stringify({ jsonrpc: "2.0", id: query, method: "tools/call", params: { name: "catalog_search", arguments: { query } } }) }).then(response => response.json());
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE|private\.example|secret=bad/);
+  }
+  assert.deepEqual(failures.filter(event => event.type === "slack_readonly_tool_completed").map(event => event.status), ["unavailable", "authorization_error"]);
+  assert.ok(failures.filter(event => event.type === "slack_readonly_tool_completed").every(event => event.durationMs >= 0 && event.callCount > 0));
+  assert.doesNotMatch(JSON.stringify(failures), /PRIVATE|private\.example|secret=bad|arguments/);
+} finally { await unavailable.close(); }
 console.log("Slack dynamic read-only gateway tests passed");

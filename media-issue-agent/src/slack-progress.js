@@ -16,6 +16,29 @@ const REPAIR_FAILURE_EVENTS = new Set([
   "repair_failed_awaiting_operator_review", "interrupted_repair_run_recovered",
   "execution_failed", "repair_agent_failed", "repair_agent_needs_operator_decision"
 ]);
+const CAPABILITY_ACTIONS = Object.freeze({
+  sonarr_series_missing_episodes: "missing episode check",
+  sonarr_missing_episode_candidate_matrix: "episode candidate check",
+  radarr_blocklist_movie_file_source: "source suppression request",
+  radarr_blocklist_movie_source: "source suppression request",
+  qbittorrent_import_prowlarr_torrent: "torrent metadata handoff request",
+  qbittorrent_url_job_status: "torrent handoff status check",
+  qbittorrent_cancel_url_job: "torrent handoff cancellation request",
+  media_wait_for_download_import: "download import status check",
+  media_path_map_status: "path mapping check",
+  media_list_series_files: "series file inspection",
+  media_probe_decode_interval: "file decode check",
+  media_verify_subtitle_sync: "subtitle timing comparison",
+  media_retime_subtitle_sidecar: "subtitle timing adjustment request",
+  media_remux_compatibility_copy: "compatibility copy request",
+  plex_playback_attempt_diagnostics: "playback evidence check",
+  plex_issue_session_correlation: "playback evidence check",
+  plex_transcode_session_diagnostics: "transcode evidence check",
+  plex_test_playback: "playback decision check",
+  plex_set_stream_preferences: "stream preference update request",
+  plex_set_default_stream_or_mkv_track_flags: "stream preference update request",
+  plex_scan_status: "library scan status check"
+});
 
 function toolKey(value) {
   if (typeof value !== "string") return "";
@@ -28,7 +51,8 @@ function toolActivity(value) {
   const serviceKey = name.split("_")[0];
   const service = Object.hasOwn(SERVICES, serviceKey) ? SERVICES[serviceKey] : "Media service";
   let action = "operation";
-  if (/_(?:verify|verification)(?:_|$)/.test(name)) action = "verification check";
+  if (Object.hasOwn(CAPABILITY_ACTIONS, name)) action = CAPABILITY_ACTIONS[name];
+  else if (/_(?:verify|verification)(?:_|$)/.test(name)) action = "verification check";
   else if (/_replace(?:_|$)/.test(name)) action = "media replacement request";
   else if (/_download_.*subtitles/.test(name)) action = "subtitle download request";
   else if (/_subtitle.*(?:search|candidates)|_subtitles?_search/.test(name)) action = "subtitle candidate check";

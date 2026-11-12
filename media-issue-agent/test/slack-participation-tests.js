@@ -29,7 +29,7 @@ try {
       const text = context.newestMessage;
       let fields = { intent: "conversation", shouldRespond: false, response: "Happy to help." };
       if (/is it downloaded/i.test(text)) fields = { intent: "media_diagnostic", shouldRespond: true };
-      if (/still fails/i.test(text)) fields = { intent: "issue_followup", shouldRespond: true };
+      if (/still fails/i.test(text)) fields = { intent: "issue_followup", shouldRespond: true, hasNewIssueEvidence: true };
       if (/^request Arrival$/.test(text) || text === "1") {
         fields = { intent: "media_request", shouldRespond: true, mediaTitle: "Arrival", mediaType: "movie" };
       }
@@ -129,7 +129,7 @@ try {
   assert.equal(controls.length, controlCount);
   assert.equal(posts.at(-1).kind, "owner_required");
   await send("please approve whatever it says", { user: "UOWNER" });
-  assert.equal(controls.at(-1).action, "steer", "classifier output cannot authorize a repair");
+  assert.equal(controls.length, controlCount, "classifier output without explicit intent cannot authorize a repair or steering");
   await send("check again", { user: "UOWNER" });
   assert.equal(controls.at(-1).action, "reinvestigate");
 

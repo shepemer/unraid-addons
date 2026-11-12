@@ -17,6 +17,19 @@ function privateKey(key) {
   return PRIVATE_KEYS.test(normalized) || PRIVATE_EXACT_KEYS.has(normalized) || /(?:url|uri|address)$/.test(normalized);
 }
 
+function plexDirectoryCollection(key, value, parentKey) {
+  // Plex calls its library/season metadata collection Directory. It is not a
+  // filesystem listing; retain only the recognizable media collection shape.
+  return parentKey === "MediaContainer" && key === "Directory" && Array.isArray(value)
+    && value.every(record => record && typeof record === "object" && !Array.isArray(record)
+      && ["movie", "show", "season", "episode", "artist", "album", "track", "photo"].includes(record.type)
+      && /^\d+$/.test(String(record.ratingKey ?? record.key ?? "")));
+}
+
+function privateField(key, value, parentKey) {
+  return privateKey(key) && !plexDirectoryCollection(key, value, parentKey);
+}
+
 export function scrubSlackGatewayText(value, identities = []) {
   let text = redactText(String(value))
     .replace(/<@[A-Z0-9]+>|<![^>]+>|<#[^>]+>/gi, "[private identity]")
@@ -36,7 +49,7 @@ export function scrubSlackGatewayText(value, identities = []) {
   return text;
 }
 
-function collectIdentityValues(value, found, depth = 0, privateBranch = false) {
+function collectIdentityValues(value, found, depth = 0, privateBranch = false, parentKey = "") {
   if (depth > 16 || found.size > 500) return;
   if (typeof value === "string") {
     if (privateBranch && value.length >= 3 && value.length <= 500) found.add(value);
@@ -44,30 +57,40 @@ function collectIdentityValues(value, found, depth = 0, privateBranch = false) {
   }
   if (!value || typeof value !== "object") return;
   if (Array.isArray(value)) {
-    for (const item of value.slice(0, 500)) collectIdentityValues(item, found, depth + 1, privateBranch);
+    for (const item of value.slice(0, 500)) collectIdentityValues(item, found, depth + 1, privateBranch, parentKey);
     return;
   }
   // Settings often encode secrets as {name: 'apiKey', value: '...'}.
   const labeledPrivate = privateKey(value.name || value.Name || value.key || value.Key || "");
-  for (const [key, item] of Object.entries(value).slice(0, 500)) collectIdentityValues(item, found, depth + 1, privateBranch || privateKey(key) || (labeledPrivate && /^(?:value|val)$/i.test(key)));
+  for (const [key, item] of Object.entries(value).slice(0, 500)) collectIdentityValues(item, found, depth + 1, privateBranch || privateField(key, item, parentKey) || (labeledPrivate && /^(?:value|val)$/i.test(key)), key);
 }
 
 export function scrubSlackGatewayValue(value, options = {}) {
   const identities = new Set(options.identities || []);
   collectIdentityValues(value, identities);
   let remaining = options.maxNodes || 6000;
-  const walk = (item, depth = 0) => {
-    if (--remaining < 0 || depth > 16) return "[truncated]";
+  const truncate = () => options.onTruncate?.();
+  const walk = (item, depth = 0, parentKey = "") => {
+    if (--remaining < 0 || depth > 16) { truncate(); return "[truncated]"; }
     if (item === null || typeof item === "boolean") return item;
     if (typeof item === "number") return Number.isFinite(item) ? item : null;
-    if (typeof item === "string") return scrubSlackGatewayText(item, identities).slice(0, Math.min(16000, options.maxStringChars || 4000));
+    if (typeof item === "string") {
+      const text = scrubSlackGatewayText(item, identities);
+      const limit = Math.min(16000, options.maxStringChars || 4000);
+      if (text.length > limit) truncate();
+      return text.slice(0, limit);
+    }
     if (!item || typeof item !== "object") return OMIT;
-    if (Array.isArray(item)) return item.slice(0, 250).map(entry => walk(entry, depth + 1)).filter(entry => entry !== OMIT);
+    if (Array.isArray(item)) {
+      if (item.length > 250) truncate();
+      return item.slice(0, 250).map(entry => walk(entry, depth + 1, parentKey)).filter(entry => entry !== OMIT);
+    }
     const labeledPrivate = privateKey(item.name || item.Name || item.key || item.Key || "");
     const entries = [];
+    if (Object.keys(item).length > 500) truncate();
     for (const [key, child] of Object.entries(item).slice(0, 500)) {
-      if (["__proto__", "prototype", "constructor"].includes(key) || privateKey(key) || (labeledPrivate && /^(?:value|val|name|key)$/i.test(key))) continue;
-      const scrubbed = walk(child, depth + 1);
+      if (["__proto__", "prototype", "constructor"].includes(key) || privateField(key, child, parentKey) || (labeledPrivate && /^(?:value|val|name|key)$/i.test(key))) continue;
+      const scrubbed = walk(child, depth + 1, key);
       if (scrubbed !== OMIT) entries.push([scrubSlackGatewayText(key, identities).slice(0, 160), scrubbed]);
     }
     return Object.fromEntries(entries);
@@ -77,6 +100,21 @@ export function scrubSlackGatewayValue(value, options = {}) {
 }
 
 export const scrubSlackReadOnlyValue = scrubSlackGatewayValue;
+
+function internalMediaReferenceKey(key) {
+  return /^(?:id|ids|key|keys|guid|guids|uuid|uuids|cursor|nextCursor)$/i.test(key)
+    || /(?:[a-z](?:Id|ID|Ids|IDs|Key|Keys|Guid|GUID|Uuid|UUID)|[_-](?:id|ids|key|keys|guid|uuid))$/.test(key);
+}
+
+export function slackPublicEvidence(value) {
+  // The research worker receives selectors so it can traverse discovered
+  // tools. The presentation model has no use for those internal references.
+  if (Array.isArray(value)) return value.map(slackPublicEvidence);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !internalMediaReferenceKey(key))
+    .map(([key, child]) => [key, slackPublicEvidence(child)]));
+}
 
 function safeSchema(schema, depth = 0) {
   if (depth > MAX_SCHEMA_DEPTH || !schema || typeof schema !== "object" || Array.isArray(schema)) return null;
@@ -222,35 +260,69 @@ export function validateSlackGatewayArguments(schema, value, depth = 0) {
 const rpcError = (id, message, code = -32600) => ({ jsonrpc: "2.0", id: id ?? null, error: { code, message } });
 const rpcResult = (id, result) => ({ jsonrpc: "2.0", id, result });
 
-function boundedPublicResult(value, maximumBytes) {
-  const scrubbed = scrubSlackGatewayValue(value);
-  const text = JSON.stringify(scrubbed);
-  if (Buffer.byteLength(text) <= maximumBytes) return { value: scrubbed, text };
-  // Preserve useful structured rows/fields rather than cut JSON mid-string.
-  if (Array.isArray(scrubbed)) {
+const jsonBytes = value => Buffer.byteLength(JSON.stringify(value));
+
+function fitPublicValue(value, maximumBytes) {
+  if (jsonBytes(value) <= maximumBytes) return value;
+  if (maximumBytes < 2) return OMIT;
+  if (typeof value === "string") {
+    let text = "";
+    // Iterate code points to keep both JSON escaping and UTF-8 byte limits.
+    for (const character of value) {
+      if (jsonBytes(`${text}${character}…`) > maximumBytes) break;
+      text += character;
+    }
+    return text && jsonBytes(`${text}…`) <= maximumBytes ? `${text}…` : OMIT;
+  }
+  if (Array.isArray(value)) {
     const records = [];
-    for (const item of scrubbed) {
-      if (Buffer.byteLength(JSON.stringify({ records: [...records, item], truncated: true })) > maximumBytes) break;
-      records.push(item);
+    for (const [index, item] of value.entries()) {
+      const remaining = maximumBytes - jsonBytes(records) - (records.length ? 1 : 0);
+      if (remaining < 2) break;
+      // Share the budget among several rows/hubs instead of allowing one large
+      // synopsis or stream list to crowd every other search match out.
+      const rowBudget = Math.min(remaining, Math.max(128, Math.floor(remaining / Math.min(8, value.length - index))));
+      const projected = fitPublicValue(item, rowBudget);
+      if (projected !== OMIT && jsonBytes([...records, projected]) <= maximumBytes) records.push(projected);
     }
-    const result = { records, truncated: true };
-    return { value: result, text: JSON.stringify(result) };
+    return records;
   }
-  if (scrubbed && typeof scrubbed === "object") {
-    const result = { truncated: true };
-    for (const [key, item] of Object.entries(scrubbed)) {
-      if (Array.isArray(item)) {
-        const records = [];
-        for (const row of item) {
-          if (Buffer.byteLength(JSON.stringify({ ...result, [key]: [...records, row] })) > maximumBytes) break;
-          records.push(row);
-        }
-        if (records.length || !item.length) result[key] = records;
-      } else if (Buffer.byteLength(JSON.stringify({ ...result, [key]: item })) <= maximumBytes) result[key] = item;
+  if (value && typeof value === "object") {
+    const result = {};
+    const rank = item => item && typeof item === "object" ? 1 : typeof item === "string" && item.length > 200 ? 2 : 0;
+    const entries = Object.entries(value).sort((left, right) => rank(left[1]) - rank(right[1]));
+    for (const [index, [key, item]] of entries.entries()) {
+      const overhead = jsonBytes({ [key]: null }) - 4 - 2 + (Object.keys(result).length ? 1 : 0);
+      const remaining = maximumBytes - jsonBytes(result) - overhead;
+      if (remaining < 1) continue;
+      const containers = item && typeof item === "object"
+        ? entries.slice(index).filter(([, child]) => child && typeof child === "object").length : 1;
+      const fieldBudget = Math.min(remaining, Math.max(128, Math.floor(remaining / Math.min(containers, 4))));
+      const projected = fitPublicValue(item, fieldBudget);
+      if (projected !== OMIT && jsonBytes({ ...result, [key]: projected }) <= maximumBytes) result[key] = projected;
     }
-    return { value: result, text: JSON.stringify(result) };
+    return result;
   }
-  return { value: { truncated: true }, text: '{"truncated":true}' };
+  return OMIT;
+}
+
+function boundedPublicResult(value, maximumBytes) {
+  let truncated = false;
+  const scrubbed = scrubSlackGatewayValue(value, { onTruncate: () => { truncated = true; } });
+  const text = JSON.stringify(scrubbed);
+  if (!truncated && Buffer.byteLength(text) <= maximumBytes) return { value: scrubbed, text };
+  // Preserve nested collection shape (e.g. Plex MediaContainer.Hub.Metadata),
+  // useful scalar IDs/dates/counts, and an explicit incomplete-evidence marker.
+  let result = { truncated: true };
+  if (Array.isArray(scrubbed)) {
+    const projected = fitPublicValue(scrubbed, maximumBytes - jsonBytes({ records: [], truncated: true }) + 2);
+    if (projected !== OMIT) result.records = projected;
+  } else if (scrubbed && typeof scrubbed === "object") {
+    const { truncated: _existing, ...fields } = scrubbed;
+    const projected = fitPublicValue(fields, maximumBytes - jsonBytes({ truncated: true }) + 1);
+    if (projected !== OMIT) result = { ...projected, truncated: true };
+  }
+  return { value: result, text: JSON.stringify(result) };
 }
 
 async function requestBody(req) {
@@ -275,6 +347,8 @@ function withAbort(promise, signal) {
 }
 
 export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
+  const startedAt = Date.now();
+  const emit = event => { try { hooks.onEvent?.(event); } catch { /* Logging cannot relax the boundary. */ } };
   const deadlineMs = Number(hooks.deadlineMs || Date.now() + 120000);
   const maxCalls = Math.max(1, Math.min(100, Number(hooks.maxCalls || 12)));
   const maxOutputBytes = Math.max(256, Math.min(1024 * 1024, Number(hooks.maxOutputBytes || 48 * 1024)));
@@ -292,15 +366,16 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
   } catch (error) {
     clearTimeout(deadlineTimer);
     controller.abort();
+    emit({ type: "slack_readonly_catalog", status: "unavailable", toolCount: 0, durationMs: Date.now() - startedAt });
     throw new Error("Read-only media capability discovery is unavailable");
   }
   const catalog = slackReadOnlyToolCatalog(discovered);
+  emit({ type: "slack_readonly_catalog", status: "ok", toolCount: catalog.length, durationMs: Date.now() - startedAt });
   const tools = new Map(catalog.map(tool => [tool.name, tool]));
   const token = `slack-readonly-${randomBytes(24).toString("hex")}`;
   const evidence = [];
   const usage = { calls: 0, outputBytes: 0, rejectedCalls: 0, exhausted: false, toolCount: catalog.length };
   let serial = Promise.resolve();
-  const emit = event => { try { hooks.onEvent?.(event); } catch { /* Logging cannot relax the boundary. */ } };
   const handle = async request => {
     if (!request || typeof request !== "object" || Array.isArray(request) || request.jsonrpc !== "2.0" || typeof request.method !== "string" || (request.id !== undefined && typeof request.id !== "string" && typeof request.id !== "number")) return rpcError(request?.id, "Invalid request");
     const notification = !Object.hasOwn(request, "id");
@@ -314,26 +389,38 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
     const args = request.params?.arguments ?? {};
     if (!tool || !validateSlackGatewayArguments(tool.inputSchema, args) || Buffer.byteLength(JSON.stringify(args)) > 16 * 1024 || Object.keys(request.params || {}).some(key => !["name", "arguments", "_meta"].includes(key))) {
       usage.rejectedCalls += 1;
+      emit({ type: "slack_readonly_tool_rejected", ...(tool ? { toolName: tool.name } : {}), status: tool ? "invalid_arguments" : "not_allowed", callCount: usage.calls, durationMs: 0 });
       return rpcError(request.id, "Read-only capability or arguments are not allowed", -32602);
     }
     if (usage.calls >= maxCalls || usage.outputBytes >= maxOutputBytes - 128) {
       usage.exhausted = true;
+      emit({ type: "slack_readonly_tool_rejected", toolName: tool.name, status: "budget_exceeded", callCount: usage.calls, durationMs: 0 });
       return rpcError(request.id, "Read-only diagnostic budget reached", -32001);
     }
     usage.calls += 1;
-    emit({ type: "slack_readonly_tool_started", toolName: tool.name });
+    const callStartedAt = Date.now();
+    emit({ type: "slack_readonly_tool_started", toolName: tool.name, status: "started", callCount: usage.calls });
+    const completed = (status, outputBytes = 0) => emit({ type: "slack_readonly_tool_completed", toolName: tool.name, status, callCount: usage.calls, durationMs: Date.now() - callStartedAt, outputBytes });
     let publicResult;
+    let status = "ok";
     try {
       const raw = await withAbort(Promise.resolve().then(() => hooks.callTool(tool.name, args, { signal })), signal);
-      if (!checkActive()) { usage.exhausted = true; return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
+      if (!checkActive()) { usage.exhausted = true; completed("cancelled"); return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
+      if (raw?.available === false || raw?.configured === false) status = "unavailable";
+      else if (raw?.error || raw?.isError === true || raw?.ok === false) status = "upstream_error";
       publicResult = boundedPublicResult(raw, Math.min(perResultBytes, maxOutputBytes - usage.outputBytes));
-    } catch {
-      if (!checkActive()) { usage.exhausted = true; return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
+      if (status === "ok" && publicResult.value?.truncated === true) status = "truncated";
+    } catch (error) {
+      if (!checkActive()) { usage.exhausted = true; completed("cancelled"); return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
+      const message = String(error?.message || "");
+      status = /timeout|timed out|deadline/i.test(message) ? "timeout"
+        : /\b(?:401|403)\b|unauthorized|forbidden/i.test(message) ? "authorization_error"
+          : /ECONN|ENOTFOUND|fetch failed|network/i.test(message) ? "connection_error" : "upstream_error";
       publicResult = { value: { available: false, error: "Read-only lookup unavailable" }, text: '{"available":false,"error":"Read-only lookup unavailable"}' };
     }
     usage.outputBytes += Buffer.byteLength(publicResult.text);
     evidence.push({ tool: tool.name, arguments: scrubSlackGatewayValue(args), result: publicResult.value });
-    emit({ type: "slack_readonly_tool_completed", toolName: tool.name });
+    completed(status, Buffer.byteLength(publicResult.text));
     return rpcResult(request.id, { content: [{ type: "text", text: publicResult.text }] });
   };
   const server = http.createServer(async (req, res) => {
@@ -365,7 +452,7 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
   deadlineTimer.unref?.();
   return {
     url: `http://127.0.0.1:${server.address().port}/mcp`, token, tools: structuredClone(catalog),
-    getEvidence: () => structuredClone(evidence),
+    getEvidence: () => structuredClone(slackPublicEvidence(evidence)),
     getUsage: () => ({ ...usage, expired: expired || Date.now() >= deadlineMs }),
     async close() {
       clearTimeout(deadlineTimer);

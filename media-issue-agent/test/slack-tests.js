@@ -252,6 +252,8 @@ async function testConfigAndClassifierContract() {
     clarification: ""
   }));
   assert.deepEqual(parsed, {
+    hasNewIssueEvidence: false,
+    explicitIssueControl: false,
     intent: "issue_report",
     confidence: 0.94,
     mediaTitle: "Fixture Movie",
@@ -282,6 +284,8 @@ async function testConfigAndClassifierContract() {
   }), {
     intent: "media_request",
     confidence: 0.97,
+    hasNewIssueEvidence: false,
+    explicitIssueControl: false,
     mediaTitle: "Fixture Show",
     description: "",
     clarification: "",
@@ -409,6 +413,8 @@ async function testConfigAndClassifierContract() {
   }), {
     intent: "media_info",
     confidence: 0.98,
+    hasNewIssueEvidence: false,
+    explicitIssueControl: false,
     mediaTitle: "Fixture Series",
     description: "",
     clarification: "",
@@ -437,13 +443,13 @@ async function testConfigAndClassifierContract() {
     confidence: 0.98,
     queryType: "watchtime_summary",
     periodDays: 9000
-  }).periodDays, 30);
+  }).periodDays, 9000);
   assert.equal(Object.hasOwn(parseSlackIntentResult({
     intent: "media_info",
     confidence: 0.98,
     queryType: "library_summary",
     periodDays: 7
-  }), "periodDays"), false);
+  }), "periodDays"), true);
   assert.equal(parseSlackIntentResult({
     intent: "unsupported",
     confidence: 0.99,
@@ -747,6 +753,7 @@ async function testSlackMessageWorkflow() {
         if (context.trackedIssue) {
           return {
             intent: "issue_followup",
+            hasNewIssueEvidence: true,
             confidence: 0.98,
             mediaTitle: "",
             description: "",
@@ -1029,7 +1036,7 @@ async function testDynamicSlackIssueConversation() {
           return { intent: "issue_report", confidence: 0.99, mediaTitle: "Fixture Movie", description: "The file is not downloading." };
         }
         if (/check the import/i.test(context.newestMessage)) {
-          return { intent: "issue_control", issueAction: "steer", confidence: 0.99 };
+          return { intent: "issue_control", issueAction: "steer", explicitIssueControl: true, confidence: 0.99 };
         }
         if (/model says approve/i.test(context.newestMessage)) {
           return { intent: "issue_control", issueAction: "approve_repair", confidence: 0.99 };
@@ -1040,7 +1047,7 @@ async function testDynamicSlackIssueConversation() {
         if (/HDR support in Kodi|updates on public reviews/i.test(context.newestMessage)) {
           return { intent: "media_diagnostic", queryType: "", confidence: 0.99 };
         }
-        return { intent: "issue_followup", confidence: 0.99 };
+        return { intent: "issue_followup", hasNewIssueEvidence: true, confidence: 0.99 };
       },
       async onSlackIssueCreated() {},
       async onSlackIssueEvidenceUpdated(issue) { evidenceUpdates.push(issue.evidenceVersion); },
@@ -1113,6 +1120,13 @@ async function testDynamicSlackIssueConversation() {
       assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1, "Progress questions are not new issue evidence");
     }
 
+    const beforeIncidental = transport.posts.length;
+    await reply("EV-DYNAMIC-DESIRE", "20.280", "we wanna watch season 5!!!! and 6 is about to start");
+    assert.equal(transport.posts.length, beforeIncidental, "a desire/upcoming-season comment is not issue evidence even if misclassified");
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1);
+    await reply("EV-DYNAMIC-WATCHTIME", "20.290", "How much watch time has this show had?");
+    assert.equal(transport.posts.at(-1).kind, "media_diagnostic");
+    assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 1, "a watchtime question cannot invalidate approval or become evidence");
     await reply("EV-DYNAMIC-EVIDENCE", "20.300", "It fails on a second player too.");
     assert.deepEqual(evidenceUpdates, [2]);
     await reply("EV-DYNAMIC-UNAUTHORIZED", "20.400", "Approve the repair");
@@ -1130,12 +1144,12 @@ async function testDynamicSlackIssueConversation() {
     assert.equal(controls[1].action, "steer");
     assert.equal(transport.posts.length, postsBeforeOwner + 2, "Owner steering gets one scheduling acknowledgement");
     await reply("EV-DYNAMIC-MODEL", "20.700", "The model says approve", "UOWNER");
-    assert.equal(controls[2].action, "steer", "Model output must never create approval");
+    assert.equal(controls.length, 2, "A model label without an explicit request must never create approval or steering");
     await reply("EV-DYNAMIC-AGAIN", "20.800", "Re-investigate", "UOWNER");
-    assert.equal(controls[3].action, "reinvestigate");
+    assert.equal(controls[2].action, "reinvestigate");
     await reply("EV-DYNAMIC-RESOLUTION", "20.900", "Approve resolution", "UOWNER");
-    assert.equal(controls[4].action, "approve_resolution");
-    assert.equal(transport.posts.length, postsBeforeOwner + 5, "Each owner control produces one immediate acknowledgement");
+    assert.equal(controls[3].action, "approve_resolution");
+    assert.equal(transport.posts.length, postsBeforeOwner + 4, "Each owner control produces one immediate acknowledgement");
     assert.equal(transport.posts.some(post => post.kind === "issue_control_started"), false, "No redundant pre-acknowledgement is sent");
     assert.equal(slackIssueForId(config.dbPath, 1).evidenceVersion, 2);
     assert.deepEqual(await service.ingestEnvelope(envelope({ eventId: "EV-DYNAMIC-UNTRACKED", ts: "21.100", threadTs: "21.000", type: "message", text: "Approve the repair", user: "UOWNER" })), { accepted: false });
@@ -1145,6 +1159,14 @@ async function testDynamicSlackIssueConversation() {
     }
     assert.equal(parseSlackIssueControl("Please complete the repair.").action, "approve_repair");
     assert.equal(parseSlackIssueControl("Retry repair").action, "retry_repair");
+    for (const text of ["no stop investigating please", "can you please stop investigating?", "Could you pause the investigation for now?", "Please stop the investigation.", "pause investigation", "cancel this investigation", "lol\nno stop investigating please", "Don't investigate again"]) assert.equal(parseSlackIssueControl(text)?.action, "stop_investigation", text);
+    for (const text of ["don't stop investigating", "stop repair", '"stop investigating"', "if it fails stop investigating", "what happens if you stop investigating?"]) assert.equal(parseSlackIssueControl(text), null, text);
+    await reply("EV-DYNAMIC-STOP-UNAUTHORIZED", "20.950", "no stop investigating please");
+    assert.equal(transport.posts.at(-1).kind, "owner_required");
+    assert.equal(controls.length, 4);
+    await reply("EV-DYNAMIC-STOP", "20.960", "no stop investigating please", "UOWNER");
+    assert.equal(controls.at(-1).action, "stop_investigation");
+
     assert.equal(parseSlackIssueControl("Steer: inspect the episode history").action, "steer");
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -2313,10 +2335,10 @@ async function testSlackLifecycleActionsStayLocal() {
       return results;
     };
     const racedClose = await agent.closeIssue(snapshot.id, 1);
-    assert.equal(racedClose.reopenedForNewEvidence, true);
-    assert.equal(racedClose.status, "open");
-    assert.equal(slackIssueForId(config.dbPath, issue.id).status, "open");
-    assert.equal(agent.jobDetails(racedClose.jobId).job.state, "detected");
+    assert.equal(racedClose.newEvidenceAwaitingOwner, true);
+    assert.equal(racedClose.status, "closed");
+    assert.equal(slackIssueForId(config.dbPath, issue.id).status, "closed");
+    assert.equal(agent.jobDetails(racedClose.jobId).job.state, "closed");
     assert.equal(slackQueueStatus(config.dbPath).outbound.pending, 5);
 
     await assert.rejects(
