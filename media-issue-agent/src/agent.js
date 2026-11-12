@@ -96,6 +96,8 @@ import { runSlackChatReply } from "./slack-chat.js";
 import { publicSlackResolution } from "./slack-resolution.js";
 import { publicSlackRepairProgress, slackRepairFailureAttempt } from "./slack-progress.js";
 import { publicResearchTimeframe } from "./slack-readonly.js";
+import { validateSlackResearchAuthorization, rememberPlaybackGrant } from "./slack-authorization.js";
+import { runSlackOutboundRewrite } from "./slack-outbound-rewrite.js";
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -3178,6 +3180,7 @@ export class MediaIssueAgent {
       historyCount: Array.isArray(context?.recentMessages) ? context.recentMessages.length : 0
     });
     const output = await runCodexSlackIntent(this.config, context, settings, {
+      authorization: validateSlackResearchAuthorization(this.config, metadata.authorization, metadata),
       onEvent: event => this.recordCodexTokenUsage(event, {
         source: "slack_intent",
         settings
@@ -3197,6 +3200,8 @@ export class MediaIssueAgent {
     await this.init();
     await validateCodexHome(this.config.codexHome);
     const settings = this.codexSettings().effective;
+    const authorization = validateSlackResearchAuthorization(this.config, metadata.authorization, metadata);
+    const isAuthorized = () => !authorization || Boolean(validateSlackResearchAuthorization(this.config, authorization, metadata));
     const issue = metadata.slackIssueId ? slackIssueForId(this.config.dbPath, metadata.slackIssueId) : null;
     const scopedContext = {
       ...context,
@@ -3208,6 +3213,9 @@ export class MediaIssueAgent {
     const timer = setTimeout(() => controller.abort("Chat research budget reached"), SLACK_RESEARCH_LIMITS.totalTimeoutMs);
     try {
       const facts = await this.slackDiagnosticRunner(this.config, scopedContext, settings, {
+        authorization,
+        isAuthorized,
+        onDiagnosticTarget: target => rememberPlaybackGrant(this.config, authorization, target.targetRef, target.resolvedUserId),
         listTools: options => this.client.listTools?.(options) || [],
         callTool: (name, args, options) => this.client.callTool(name, args, options),
         abortSignal: controller.signal,
@@ -3228,11 +3236,14 @@ export class MediaIssueAgent {
           }
         }
       });
+      if (!isAuthorized()) return { kind: "media_diagnostic", message: "Diagnostic access changed while I was checking. I stopped using that account’s evidence." };
       const message = await this.slackReplyRunner({ ...this.config, codexTerminationGraceMs: 100 }, scopedContext, facts, settings, {
+        authorization,
         abortSignal: controller.signal,
         timeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())), tokenBudget: 6000,
         onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_chat_reply", settings })
       });
+      if (!isAuthorized()) return { kind: "media_diagnostic", message: "Diagnostic access changed while I was checking. I stopped using that account’s evidence." };
       return { kind: "media_diagnostic", message };
     } catch (error) {
       this.diagnostic("warn", "slack_research_incomplete", { threadId: metadata.threadId, error: error.message });
@@ -3240,6 +3251,17 @@ export class MediaIssueAgent {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async slackPlaybackResolve(query, matchBy) {
+    return this.client.callTool("media_resolve_playback_user", { query, ...(matchBy ? { matchBy } : {}) });
+  }
+
+  async slackOutboundRewrite(context) {
+    const settings = this.codexSettings().effective;
+    return runSlackOutboundRewrite(this.config, context, settings, {
+      onEvent: event => this.recordCodexTokenUsage(event, { source: "slack_chat_rewrite", settings })
+    });
   }
 
   async slackIssueStatus(issueId) {

@@ -10,6 +10,7 @@ import { createDownloadRepairCapabilities, exactTorrentFromAddResult, registerDo
 import { plexScanStatus, registerPlexDiagnosticsTools, runPlexSectionScan } from "./plex-diagnostics.js";
 import { registerMediaFilesystemTools, mediaFileInputOptions } from "./media-filesystem.js";
 import { createPublicWatchtimeSummary } from "./public-watchtime.js";
+import { registerUserPlaybackDiagnostics } from "./user-playback-diagnostics.js";
 
 const env = process.env;
 const port = Number(env.MEDIA_MCP_PORT || 6971);
@@ -11430,6 +11431,9 @@ function createServer() {
 
   registerThreadfinTools(server);
   registerPlexDiagnosticsTools(server, { plexApi, getService: () => requireService("plex"), redactText, jsonText });
+  registerUserPlaybackDiagnostics(server, { tautulliApi, plexApi, jsonText,
+    configured: { tautulli: Boolean(configuredServices.tautulli), plex: Boolean(configuredServices.plex) },
+    timeoutMs: Math.min(25000, requestTimeoutMs) });
 
   server.registerTool("plex_status", {
     title: "Plex Status",

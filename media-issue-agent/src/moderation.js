@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 
 export const OPENAI_MODERATIONS_URL = "https://api.openai.com/v1/moderations";
 export const SLACK_MODERATION_MODEL = "omni-moderation-latest";
-export const SLACK_MODERATION_POLICY_VERSION = "2026-07-25.1";
+export const SLACK_MODERATION_POLICY_VERSION = "2026-11-12.1";
 export const SLACK_MODERATION_MAX_CHARACTERS = 4000;
 
 const MODERATION_TIMEOUT_MS = 10000;
@@ -159,7 +159,7 @@ export function decideSlackModeration(parsed, options = {}) {
     return { verdict: "allow", category: "", flaggedCategories };
   }
   if (
-    options.direction !== "outbound"
+    (options.direction !== "outbound" || options.allowMildHarassment === true)
     && flaggedCategories.length > 0
     && flaggedCategories.every(category => NON_THREATENING_HARASSMENT.has(category))
   ) {

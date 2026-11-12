@@ -10,7 +10,7 @@
     "test:bazarr-subtitles": "node test-bazarr-subtitle-tools.js",
     "test:public-info": "node test-public-media-info.js && node test-public-watchtime.js",
     "test:readonly-discovery": "node test-readonly-discovery.js",
-    "test:repair-capabilities": "node test-repair-capability-tools.js && node test-media-filesystem.js && node test-plex-diagnostics.js && node test-download-repair.js && node test-download-deadlines.js",
+    "test:repair-capabilities": "node test-repair-capability-tools.js && node test-media-filesystem.js && node test-plex-diagnostics.js && node test-download-repair.js && node test-download-deadlines.js && node test-user-playback-diagnostics.js",
     "test:plex-issues": "node test-plex-reported-issues.js",
     "test:seerr-issues": "node test-seerr-update-issue.js",
     "test:threadfin": "node test-threadfin-tools.js"

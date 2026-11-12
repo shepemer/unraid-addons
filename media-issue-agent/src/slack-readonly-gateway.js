@@ -1,6 +1,7 @@
 import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { redactText } from "./redact.js";
+import { normalizeSlackResearchAuthorization, slackResearchIdentityTerms } from "./slack-research-policy.js";
 
 const OMIT = Symbol("private");
 const keyOf = key => String(key).replace(/[^a-z0-9]/gi, "").toLowerCase();
@@ -102,7 +103,7 @@ export function scrubSlackGatewayValue(value, options = {}) {
 export const scrubSlackReadOnlyValue = scrubSlackGatewayValue;
 
 function internalMediaReferenceKey(key) {
-  return /^(?:id|ids|key|keys|guid|guids|uuid|uuids|cursor|nextCursor)$/i.test(key)
+  return /^(?:id|ids|key|keys|guid|guids|uuid|uuids|cursor|nextCursor|scopeRef|targetRef)$/i.test(key)
     || /(?:[a-z](?:Id|ID|Ids|IDs|Key|Keys|Guid|GUID|Uuid|UUID)|[_-](?:id|ids|key|keys|guid|uuid))$/.test(key);
 }
 
@@ -213,6 +214,58 @@ export function slackReadOnlyToolCatalog(tools) {
   });
 }
 
+const PLAYBACK_RESOLVER = "media_resolve_playback_user";
+const PLAYBACK_DIAGNOSTICS = "media_user_playback_diagnostics";
+
+function scopedPlaybackCatalog(discovered, authorization) {
+  if (authorization.mode === "public") return [];
+  const available = name => (Array.isArray(discovered) ? discovered : []).find(tool => tool?.name === name && tool.annotations?.destructiveHint !== true);
+  const diagnostic = available(PLAYBACK_DIAGNOSTICS);
+  if (!diagnostic) return [];
+  const properties = { ...(diagnostic.inputSchema?.properties || {}) };
+  delete properties.resolvedUserId;
+  const schema = safeSchema({ type: "object", properties, additionalProperties: false,
+    required: (diagnostic.inputSchema?.required || []).filter(key => key !== "resolvedUserId") });
+  if (!schema) return [];
+  const resolverAvailable = authorization.mode === "owner" && authorization.targets.length && available(PLAYBACK_RESOLVER);
+  if (authorization.mode === "owner" && !resolverAvailable) return [];
+  if (authorization.mode === "owner") {
+    schema.properties.scopeRef = { type: "string", pattern: "^playback_[a-f0-9]{32}$" };
+    schema.required = [...(schema.required || []), "scopeRef"];
+  }
+  return [
+    ...(resolverAvailable ? [{ name: PLAYBACK_RESOLVER,
+      description: "Resolve an application-authorized playback target by its targetRef. Returns an opaque scopeRef only for one exact, unambiguous match. Identity names and IDs are never returned.",
+      inputSchema: { type: "object", properties: { targetRef: { type: "string", enum: authorization.targets.map(target => target.ref) } }, required: ["targetRef"], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false } }] : []),
+    { name: PLAYBACK_DIAGNOSTICS,
+      description: "Read technical playback diagnostics for the authorized account, without watched titles or identifying details. Use the resolved scopeRef in owner mode; self mode is already bound. Preserve the requested time range; current source counts can overlap and must not be summed.",
+      inputSchema: schema, annotations: { readOnlyHint: true, destructiveHint: false } }
+  ];
+}
+
+function scopedPlaybackEvidence(value, identities) {
+  const privateField = key => internalMediaReferenceKey(key) || /(?:titles?|ratingkey|name)$|^(?:file|metadata)$/i.test(keyOf(key));
+  const sensitive = new Set(identities);
+  let truncated = false;
+  const collect = (item, hidden = false, depth = 0) => {
+    if (depth > 16) return;
+    if (typeof item === "string" && hidden && item.length >= 3 && item.length <= 500) sensitive.add(item);
+    else if (Array.isArray(item)) item.slice(0, 250).forEach(child => collect(child, hidden, depth + 1));
+    else if (item && typeof item === "object") Object.entries(item).slice(0, 500).forEach(([key, child]) => collect(child, hidden || privateField(key), depth + 1));
+  };
+  collect(value);
+  const remove = (item, depth = 0) => {
+    if (depth > 16) { truncated = true; return null; }
+    if (Array.isArray(item)) { if (item.length > 250) truncated = true; return item.slice(0, 250).map(child => remove(child, depth + 1)); }
+    if (!item || typeof item !== "object") return item;
+    if (Object.keys(item).length > 500) truncated = true;
+    return Object.fromEntries(Object.entries(item).slice(0, 500).filter(([key]) => !privateField(key)).map(([key, child]) => [key, remove(child, depth + 1)]));
+  };
+  const result = scrubSlackGatewayValue(remove(value), { identities: [...sensitive], onTruncate: () => { truncated = true; } });
+  return truncated && result && typeof result === "object" && !Array.isArray(result) ? { ...result, truncated: true } : result;
+}
+
 function validType(value, type) {
   if (type === "null") return value === null;
   if (type === "object") return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -306,9 +359,9 @@ function fitPublicValue(value, maximumBytes) {
   return OMIT;
 }
 
-function boundedPublicResult(value, maximumBytes) {
+function boundedPublicResult(value, maximumBytes, options = {}) {
   let truncated = false;
-  const scrubbed = scrubSlackGatewayValue(value, { onTruncate: () => { truncated = true; } });
+  const scrubbed = scrubSlackGatewayValue(value, { ...options, onTruncate: () => { truncated = true; } });
   const text = JSON.stringify(scrubbed);
   if (!truncated && Buffer.byteLength(text) <= maximumBytes) return { value: scrubbed, text };
   // Preserve nested collection shape (e.g. Plex MediaContainer.Hub.Metadata),
@@ -347,6 +400,12 @@ function withAbort(promise, signal) {
 }
 
 export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
+  const authorization = normalizeSlackResearchAuthorization(hooks.authorization);
+  const authorityValid = () => {
+    try { return !hooks.isAuthorized || hooks.isAuthorized() === true; } catch { return false; }
+  };
+  const identities = slackResearchIdentityTerms(authorization);
+  const playbackScopes = new Map();
   const startedAt = Date.now();
   const emit = event => { try { hooks.onEvent?.(event); } catch { /* Logging cannot relax the boundary. */ } };
   const deadlineMs = Number(hooks.deadlineMs || Date.now() + 120000);
@@ -369,7 +428,7 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
     emit({ type: "slack_readonly_catalog", status: "unavailable", toolCount: 0, durationMs: Date.now() - startedAt });
     throw new Error("Read-only media capability discovery is unavailable");
   }
-  const catalog = slackReadOnlyToolCatalog(discovered);
+  const catalog = [...slackReadOnlyToolCatalog(discovered), ...(authorityValid() ? scopedPlaybackCatalog(discovered, authorization) : [])];
   emit({ type: "slack_readonly_catalog", status: "ok", toolCount: catalog.length, durationMs: Date.now() - startedAt });
   const tools = new Map(catalog.map(tool => [tool.name, tool]));
   const token = `slack-readonly-${randomBytes(24).toString("hex")}`;
@@ -383,10 +442,16 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
     if (!checkActive()) { usage.exhausted = true; return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
     if (request.method === "initialize") return rpcResult(request.id, { protocolVersion: ["2024-11-05", "2025-03-26", "2025-06-18"].includes(request.params?.protocolVersion) ? request.params.protocolVersion : "2024-11-05", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "slack-readonly-media", version: "1.0.0" } });
     if (request.method === "ping") return rpcResult(request.id, {});
-    if (request.method === "tools/list") return rpcResult(request.id, { tools: catalog });
+    if (request.method === "tools/list") return rpcResult(request.id, { tools: authorityValid() ? catalog : catalog.filter(tool => ![PLAYBACK_RESOLVER, PLAYBACK_DIAGNOSTICS].includes(tool.name)) });
     if (request.method !== "tools/call") return rpcError(request.id, "Only discovered read-only tools are available", -32601);
     const tool = tools.get(request.params?.name);
     const args = request.params?.arguments ?? {};
+    const scopedPlayback = [PLAYBACK_RESOLVER, PLAYBACK_DIAGNOSTICS].includes(tool?.name);
+    if (scopedPlayback && !authorityValid()) {
+      usage.rejectedCalls += 1;
+      emit({ type: "slack_readonly_tool_rejected", toolName: tool.name, status: "authorization_error", callCount: usage.calls, durationMs: 0 });
+      return rpcError(request.id, "Playback diagnostic authorization is no longer current", -32602);
+    }
     if (!tool || !validateSlackGatewayArguments(tool.inputSchema, args) || Buffer.byteLength(JSON.stringify(args)) > 16 * 1024 || Object.keys(request.params || {}).some(key => !["name", "arguments", "_meta"].includes(key))) {
       usage.rejectedCalls += 1;
       emit({ type: "slack_readonly_tool_rejected", ...(tool ? { toolName: tool.name } : {}), status: tool ? "invalid_arguments" : "not_allowed", callCount: usage.calls, durationMs: 0 });
@@ -397,20 +462,76 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
       emit({ type: "slack_readonly_tool_rejected", toolName: tool.name, status: "budget_exceeded", callCount: usage.calls, durationMs: 0 });
       return rpcError(request.id, "Read-only diagnostic budget reached", -32001);
     }
-    usage.calls += 1;
     const callStartedAt = Date.now();
-    emit({ type: "slack_readonly_tool_started", toolName: tool.name, status: "started", callCount: usage.calls });
     const completed = (status, outputBytes = 0) => emit({ type: "slack_readonly_tool_completed", toolName: tool.name, status, callCount: usage.calls, durationMs: Date.now() - callStartedAt, outputBytes });
+    const upstream = async (name, upstreamArgs) => {
+      const checkAuthority = () => {
+        if ([PLAYBACK_RESOLVER, PLAYBACK_DIAGNOSTICS].includes(name) && !authorityValid()) {
+          const error = new Error("Playback diagnostic authorization is no longer current");
+          error.code = "SLACK_RESEARCH_AUTHORIZATION";
+          throw error;
+        }
+      };
+      checkAuthority();
+      if (!checkActive() || usage.calls >= maxCalls) {
+        usage.exhausted = true;
+        const error = new Error("Read-only diagnostic budget reached");
+        error.code = "SLACK_RESEARCH_BUDGET";
+        throw error;
+      }
+      usage.calls += 1;
+      emit({ type: "slack_readonly_tool_started", toolName: name, status: "started", callCount: usage.calls });
+      const result = await withAbort(Promise.resolve().then(() => { checkAuthority(); return hooks.callTool(name, upstreamArgs, { signal }); }), signal);
+      checkAuthority();
+      return result;
+    };
     let publicResult;
     let status = "ok";
     try {
-      const raw = await withAbort(Promise.resolve().then(() => hooks.callTool(tool.name, args, { signal })), signal);
+      let raw;
+      if (tool.name === PLAYBACK_RESOLVER) {
+        const target = authorization.targets.find(target => target.ref === args.targetRef);
+        const matches = new Set();
+        let resolution = "not_found";
+        for (const query of target.queries) {
+          const candidate = await upstream(PLAYBACK_RESOLVER, query);
+          if (candidate?.status === "ambiguous" || Number(candidate?.matchCount) > 1 || (candidate?.candidates || []).length > 1) { resolution = "ambiguous"; break; }
+          if (!candidate || candidate.complete !== true || !["matched", "not_found"].includes(candidate.status)) { resolution = "unavailable"; break; }
+          if (candidate.status === "matched") {
+            const id = candidate.candidates?.[0]?.resolvedUserId;
+            if (candidate.candidates?.length !== 1 || typeof id !== "string" || !/^[0-9]{1,20}$/.test(id)) { resolution = "unavailable"; break; }
+            matches.add(id);
+            if (matches.size > 1) { resolution = "ambiguous"; break; }
+            resolution = "matched";
+          }
+        }
+        if (resolution === "matched" && matches.size === 1) {
+          const scopeRef = `playback_${randomBytes(16).toString("hex")}`;
+          playbackScopes.set(scopeRef, { targetRef: target.ref, resolvedUserId: [...matches][0] });
+          raw = { available: true, status: "matched", complete: true, scopeRef };
+        } else raw = { available: resolution !== "unavailable", status: resolution, complete: resolution !== "unavailable" };
+      } else if (tool.name === PLAYBACK_DIAGNOSTICS) {
+        const target = authorization.mode === "self" ? { resolvedUserId: authorization.resolvedSelfId } : playbackScopes.get(args.scopeRef);
+        if (!target) {
+          usage.rejectedCalls += 1;
+          completed("invalid_arguments");
+          return rpcError(request.id, "Resolve the authorized target before requesting diagnostics", -32602);
+        }
+        const { scopeRef: _scopeRef, ...scope } = args;
+        raw = await upstream(PLAYBACK_DIAGNOSTICS, { ...scope, resolvedUserId: target.resolvedUserId });
+        if (raw?.available === true) {
+          try { await hooks.onDiagnosticTarget?.({ ...target }); } catch { /* Binding persistence never expands authorization. */ }
+        }
+        raw = scopedPlaybackEvidence(raw, identities);
+      } else raw = await upstream(tool.name, args);
       if (!checkActive()) { usage.exhausted = true; completed("cancelled"); return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
       if (raw?.available === false || raw?.configured === false) status = "unavailable";
       else if (raw?.error || raw?.isError === true || raw?.ok === false) status = "upstream_error";
-      publicResult = boundedPublicResult(raw, Math.min(perResultBytes, maxOutputBytes - usage.outputBytes));
+      publicResult = boundedPublicResult(raw, Math.min(perResultBytes, maxOutputBytes - usage.outputBytes), { identities });
       if (status === "ok" && publicResult.value?.truncated === true) status = "truncated";
     } catch (error) {
+      if (error?.code === "SLACK_RESEARCH_BUDGET") { completed("budget_exceeded"); return rpcError(request.id, "Read-only diagnostic budget reached", -32001); }
+      if (error?.code === "SLACK_RESEARCH_AUTHORIZATION") { completed("authorization_error"); return rpcError(request.id, "Playback diagnostic authorization is no longer current", -32602); }
       if (!checkActive()) { usage.exhausted = true; completed("cancelled"); return rpcError(request.id, "Read-only diagnostic deadline reached", -32001); }
       const message = String(error?.message || "");
       status = /timeout|timed out|deadline/i.test(message) ? "timeout"
@@ -418,8 +539,9 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
           : /ECONN|ENOTFOUND|fetch failed|network/i.test(message) ? "connection_error" : "upstream_error";
       publicResult = { value: { available: false, error: "Read-only lookup unavailable" }, text: '{"available":false,"error":"Read-only lookup unavailable"}' };
     }
+    if (scopedPlayback && !authorityValid()) { completed("authorization_error"); return rpcError(request.id, "Playback diagnostic authorization is no longer current", -32602); }
     usage.outputBytes += Buffer.byteLength(publicResult.text);
-    evidence.push({ tool: tool.name, arguments: scrubSlackGatewayValue(args), result: publicResult.value });
+    evidence.push({ tool: tool.name, arguments: scrubSlackGatewayValue(args, { identities }), result: publicResult.value });
     completed(status, Buffer.byteLength(publicResult.text));
     return rpcResult(request.id, { content: [{ type: "text", text: publicResult.text }] });
   };
@@ -452,7 +574,7 @@ export async function startSlackReadOnlyGateway(config = {}, hooks = {}) {
   deadlineTimer.unref?.();
   return {
     url: `http://127.0.0.1:${server.address().port}/mcp`, token, tools: structuredClone(catalog),
-    getEvidence: () => structuredClone(slackPublicEvidence(evidence)),
+    getEvidence: () => structuredClone(slackPublicEvidence(authorityValid() ? evidence : evidence.filter(entry => ![PLAYBACK_RESOLVER, PLAYBACK_DIAGNOSTICS].includes(entry.tool)))),
     getUsage: () => ({ ...usage, expired: expired || Date.now() >= deadlineMs }),
     async close() {
       clearTimeout(deadlineTimer);

@@ -2403,6 +2403,11 @@ export function slackOutboxIsSending(dbPath, outboxId) {
   return Boolean(sqliteExec(dbPath, sql`SELECT id FROM slack_outbox WHERE id = ${outboxId} AND status = 'sending';`, { json: true })[0]);
 }
 
+export function cancelSlackOutbox(dbPath, outboxId) {
+  sqliteExec(dbPath, sql`UPDATE slack_outbox SET status = 'cancelled', error = 'Diagnostic authorization expired or revoked',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ${outboxId} AND status IN ('pending', 'sending');`);
+}
+
 export function completeSlackOutbox(dbPath, outboxId, result) {
   return sqliteTransaction(dbPath, database => {
     const item = database.prepare(sql`

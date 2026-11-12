@@ -129,6 +129,7 @@ try {
   assert.equal(validateSlackGatewayArguments(gatewayTools.get("media_public_watchtime_summary").inputSchema, { periodDays: 30, userId: "UPRIVATE" }), false);
   for (const name of ["plex_active_sessions", "tautulli_history", "tracearr_history", "tracearr_users", "seerr_request_details", "seerr_list_issues", "media_file_delete", "sonarr_search_episode", "seerr_request_media",
     "plex_playback_attempt_diagnostics", "plex_issue_session_correlation", "plex_transcode_session_diagnostics", "plex_transcoder_logs_for_session",
+    "media_resolve_playback_user", "media_user_playback_diagnostics",
     "plex_test_playback", "plex_set_stream_preferences", "plex_set_default_stream_or_mkv_track_flags"]) {
     assert.equal(gatewayTools.has(name), false, name);
   }

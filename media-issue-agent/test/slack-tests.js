@@ -254,6 +254,9 @@ async function testConfigAndClassifierContract() {
   assert.deepEqual(parsed, {
     hasNewIssueEvidence: false,
     explicitIssueControl: false,
+    playbackDiagnostic: false,
+    playbackTarget: "",
+    playbackUserQuery: "",
     intent: "issue_report",
     confidence: 0.94,
     mediaTitle: "Fixture Movie",
@@ -286,6 +289,9 @@ async function testConfigAndClassifierContract() {
     confidence: 0.97,
     hasNewIssueEvidence: false,
     explicitIssueControl: false,
+    playbackDiagnostic: false,
+    playbackTarget: "",
+    playbackUserQuery: "",
     mediaTitle: "Fixture Show",
     description: "",
     clarification: "",
@@ -415,6 +421,9 @@ async function testConfigAndClassifierContract() {
     confidence: 0.98,
     hasNewIssueEvidence: false,
     explicitIssueControl: false,
+    playbackDiagnostic: false,
+    playbackTarget: "",
+    playbackUserQuery: "",
     mediaTitle: "Fixture Series",
     description: "",
     clarification: "",
@@ -535,7 +544,8 @@ async function testSlackClassifierFilesystemIsolation() {
     assert.ok(result.fixture.args.includes("--ignore-user-config"));
     assert.ok(result.fixture.args.includes("--ignore-rules"));
     assert.match(result.fixture.prompt, /aggregate play count and total watch time/i);
-    assert.match(result.fixture.prompt, /specific user's playback or viewing history.*unsupported/i);
+    assert.match(result.fixture.prompt, /Authorized technical playback diagnostics are media_diagnostic/);
+    assert.match(result.fixture.prompt, /Private identities.*which titles must not be disclosed/);
     assert.equal(result.fixture.args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
     assert.equal(result.fixture.args.some(value => value.includes("mcp_servers.")), false);
     assert.equal(result.fixture.args[result.fixture.args.indexOf("--sandbox") + 1], "read-only");
